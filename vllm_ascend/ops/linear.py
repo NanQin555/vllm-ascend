@@ -19,8 +19,11 @@ The classes in this file should not be modified, including AscendQKVParallelLine
 AscendMergedColumnParallelLinear, AscendMergedColumnParallelLinear,
 AscendRowParallelLinear and AscendColumnParallelLinear.
 """
+import importlib
+import os
 
 from typing import Optional, Union
+from collections.abc import Sequence
 
 import torch
 import torch.nn as nn
@@ -34,9 +37,43 @@ from vllm.model_executor.layers.linear import (  # noqa
 from vllm.model_executor.layers.quantization.base_config import \
     QuantizationConfig
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.distributed import tensor_model_parallel_all_reduce
 
 from vllm_ascend.ops.linear_op import get_parallel_op, get_replicated_op
 from vllm_ascend.utils import enable_sp, maybe_trans_nz
+
+_SHMEM_ENABLED = (
+    os.getenv("VLLM_ASCEND_ENABLE_SHMEM_MATMUL_ALLREDUCE")
+    or os.getenv("VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE", "0")
+).lower() in {"1", "true", "yes", "on"}
+
+
+def split_tensor_along_last_dim(
+    tensor: torch.Tensor,
+    num_partitions: int,
+    contiguous_split_chunks: bool = False,
+) -> Sequence[torch.Tensor]:
+    """Split a tensor along its last dimension.
+
+    Arguments:
+        tensor: input tensor.
+        num_partitions: number of partitions to split the tensor
+        contiguous_split_chunks: If True, make each chunk contiguous
+                                 in memory.
+
+    Returns:
+        A list of Tensors
+    """
+    # Get the size and dimension.
+    last_dim = tensor.dim() - 1
+    last_dim_size = divide(tensor.size()[last_dim], num_partitions)
+    # Split.
+    tensor_list = torch.split(tensor, last_dim_size, dim=last_dim)
+    # NOTE: torch.split does not create contiguous tensors by default.
+    if contiguous_split_chunks:
+        return tuple(chunk.contiguous() for chunk in tensor_list)
+
+    return tensor_list
 
 
 class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
@@ -293,6 +330,24 @@ class AscendRowParallelLinear(RowParallelLinear):
         else:
             self.register_parameter("bias", None)
 
+        self._shmem_matmul_allreduce = None
+        if _SHMEM_ENABLED:
+            try:
+                shmem_runtime = importlib.import_module("vllm_ascend.ops.shmem_runtime")
+            except ImportError:
+                pass
+            else:
+                self._shmem_matmul_allreduce = getattr(
+                    shmem_runtime, "maybe_shmem_matmul_allreduce", None
+                )
+        self._can_try_shmem_matmul_allreduce = (
+            _SHMEM_ENABLED
+            and reduce_results
+            and self.tp_size > 1
+            and self._shmem_matmul_allreduce is not None
+            and any(token in prefix for token in ("o_proj", "down_proj"))
+            and "UnquantizedLinearMethod" in type(self.quant_method).__name__
+        )
         if self.custom_op is not None:
             self.custom_op.update_attrs()
 
@@ -304,7 +359,33 @@ class AscendRowParallelLinear(RowParallelLinear):
         if self.custom_op is not None:
             return self.custom_op.apply(input_)
 
-        return super().forward(input_)
+        if self.input_is_parallel:
+            input_parallel = input_
+        else:
+            splitted_input = split_tensor_along_last_dim(
+                input_, num_partitions=self.tp_size
+            )
+            input_parallel = splitted_input[self.tp_rank].contiguous()
+        
+        assert self.quant_method is not None
+        
+        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        output = None
+        
+        if self._can_try_shmem_matmul_allreduce:
+            output, _ = self._shmem_matmul_allreduce(self, input_parallel, bias_)
+
+        if output is None:
+            output_parallel = self.quant_method.apply(self, input_parallel, bias_)
+            if self.reduce_results and self.tp_size > 1:
+                output = tensor_model_parallel_all_reduce(output_parallel)
+            else:
+                output = output_parallel
+                
+        if not self.return_bias:
+            return output
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias
 
 
 class AscendColumnParallelLinear(ColumnParallelLinear):
