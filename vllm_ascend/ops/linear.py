@@ -340,6 +340,8 @@ class AscendRowParallelLinear(RowParallelLinear):
                 self._shmem_matmul_allreduce = getattr(
                     shmem_runtime, "maybe_shmem_matmul_allreduce", None
                 )
+                if hasattr(shmem_runtime, "prepare_shmem_matmul_allreduce"):
+                    shmem_runtime.prepare_shmem_matmul_allreduce(self)
         self._can_try_shmem_matmul_allreduce = (
             _SHMEM_ENABLED
             and reduce_results
