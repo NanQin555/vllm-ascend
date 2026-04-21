@@ -126,8 +126,8 @@ class _ShmemRuntime:
         self._initialized = False
         self._ash = None
         self._shmem_operators = None
-        self._operators: dict[tuple[int, int], object] = {}
-        self._kernel_entries: dict[tuple[int, int, str], Any] = {}
+        self._operators: dict[int, object] = {}
+        self._kernel_entries: dict[tuple[int, str], Any] = {}
 
     def ensure_initialized(self) -> Optional[str]:
         with self._lock:
@@ -176,17 +176,16 @@ class _ShmemRuntime:
             )
             return None
 
-    def get_kernel_entry(self, stream_handle: int, block_dims: int, kernel_name: str):
+    def get_kernel_entry(self, block_dims: int, kernel_name: str):
         with self._lock:
-            key = (stream_handle, block_dims, kernel_name)
+            key = (block_dims, kernel_name)
             kernel_entry = self._kernel_entries.get(key)
             if kernel_entry is None:
-                operator_key = (stream_handle, block_dims)
-                operator = self._operators.get(operator_key)
+                operator = self._operators.get(block_dims)
                 if operator is None:
                     assert self._shmem_operators is not None
-                    operator = self._shmem_operators.ShmemOperators(block_dims, stream_handle)
-                    self._operators[operator_key] = operator
+                    operator = self._shmem_operators.ShmemOperators(block_dims)
+                    self._operators[block_dims] = operator
                 kernel_entry = getattr(operator, kernel_name, None)
                 self._kernel_entries[key] = kernel_entry
             return kernel_entry
@@ -259,9 +258,7 @@ def maybe_shmem_matmul_allreduce(
         weight_t = _build_weight_for_shmem(layer)
         block_dims = layer._shmem_block_dims
         kernel_name = layer._shmem_kernel_name
-        kernel_entry = _RUNTIME.get_kernel_entry(
-            stream_handle, block_dims, kernel_name
-        )
+        kernel_entry = _RUNTIME.get_kernel_entry(block_dims, kernel_name)
         if kernel_entry is None:
             reason = f"missing_shmem_kernel_entry:{kernel_name}"
             _log_skip_if_debug(layer, input_parallel, reason, expected_dtype)
@@ -283,6 +280,7 @@ def maybe_shmem_matmul_allreduce(
             input_2d.shape[0],
             weight_t.shape[1],
             input_2d.shape[1],
+            stream_handle,
         )
         output = output_2d.reshape(*input_parallel.shape[:-1], weight_t.shape[1])
         if bias is not None:

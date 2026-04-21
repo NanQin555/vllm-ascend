@@ -19,7 +19,6 @@ The classes in this file should not be modified, including AscendQKVParallelLine
 AscendMergedColumnParallelLinear, AscendMergedColumnParallelLinear,
 AscendRowParallelLinear and AscendColumnParallelLinear.
 """
-import importlib
 import os
 
 from typing import Optional, Union
@@ -40,6 +39,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.distributed import tensor_model_parallel_all_reduce
 
 from vllm_ascend.ops.linear_op import get_parallel_op, get_replicated_op
+from vllm_ascend.ops.shmem_runtime import prepare_shmem_matmul_allreduce
 from vllm_ascend.utils import enable_sp, maybe_trans_nz
 
 _SHMEM_ENABLED = (
@@ -275,14 +275,16 @@ class AscendRowParallelLinear(RowParallelLinear):
         disable_tp: bool = False,
     ):
         # TODO(kunpengW-code): Specifying the prefix in linear layers of some models in the vLLM.
-        if enable_sp():
+        self.unique_prefix = prefix
+        if enable_sp() or _SHMEM_ENABLED:
             compilation_config = get_current_vllm_config().compilation_config
-            unique_prefix = prefix
             if prefix in compilation_config.static_forward_context:
-                unique_prefix = f"{prefix}.unique_prefix{AscendRowParallelLinear.unique_prefix_idx}"
+                self.unique_prefix = (
+                    f"{prefix}.unique_prefix"
+                    f"{AscendRowParallelLinear.unique_prefix_idx}"
+                )
                 AscendRowParallelLinear.unique_prefix_idx += 1
-            self.unique_prefix = unique_prefix
-            compilation_config.static_forward_context[unique_prefix] = self
+            compilation_config.static_forward_context[self.unique_prefix] = self
 
         self.custom_op, self.tp_rank, self.tp_size = get_parallel_op(
             disable_tp, prefix, self, "row")
@@ -330,23 +332,12 @@ class AscendRowParallelLinear(RowParallelLinear):
         else:
             self.register_parameter("bias", None)
 
-        self._shmem_matmul_allreduce = None
         if _SHMEM_ENABLED:
-            try:
-                shmem_runtime = importlib.import_module("vllm_ascend.ops.shmem_runtime")
-            except ImportError:
-                pass
-            else:
-                self._shmem_matmul_allreduce = getattr(
-                    shmem_runtime, "maybe_shmem_matmul_allreduce", None
-                )
-                if hasattr(shmem_runtime, "prepare_shmem_matmul_allreduce"):
-                    shmem_runtime.prepare_shmem_matmul_allreduce(self)
+            prepare_shmem_matmul_allreduce(self)
         self._can_try_shmem_matmul_allreduce = (
             _SHMEM_ENABLED
             and reduce_results
             and self.tp_size > 1
-            and self._shmem_matmul_allreduce is not None
             and any(token in prefix for token in ("o_proj", "down_proj"))
             and "UnquantizedLinearMethod" in type(self.quant_method).__name__
         )
@@ -368,22 +359,21 @@ class AscendRowParallelLinear(RowParallelLinear):
                 input_, num_partitions=self.tp_size
             )
             input_parallel = splitted_input[self.tp_rank].contiguous()
-        
-        assert self.quant_method is not None
-        
-        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output = None
-        
-        if self._can_try_shmem_matmul_allreduce:
-            output, _ = self._shmem_matmul_allreduce(self, input_parallel, bias_)
 
-        if output is None:
+        assert self.quant_method is not None
+
+        if self._can_try_shmem_matmul_allreduce:
+            output = torch.ops.vllm.shmem_matmul_allreduce(
+                input_parallel, self.unique_prefix
+            )
+        else:
+            bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
             output_parallel = self.quant_method.apply(self, input_parallel, bias_)
             if self.reduce_results and self.tp_size > 1:
                 output = tensor_model_parallel_all_reduce(output_parallel)
             else:
                 output = output_parallel
-                
+
         if not self.return_bias:
             return output
         output_bias = self.bias if self.skip_bias_add else None
