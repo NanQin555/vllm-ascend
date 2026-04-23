@@ -13,11 +13,10 @@ logger = init_logger(__name__)
 _DEFAULT_BLOCK_DIMS = 20
 _DEFAULT_LOCAL_MEM_SIZE = 1024 * 1024 * 1024
 _DEFAULT_IP_PORT = "tcp://127.0.0.1:8667"
-_SHMEM_DEBUG_ENV = "VLLM_ASCEND_SHMEM_DEBUG"
 _CACHED_BLOCK_DIMS: Optional[int] = None
 _KERNEL_NAME_BY_DTYPE = {
     torch.float16: "shmem_matmul_allreduce",
-    torch.bfloat16: "shmem_matmul_allreduce_bf16",
+    torch.bfloat16: "shmem_matmul_allreduce_opt_bf16",
 }
 
 
@@ -25,14 +24,6 @@ def _strip_tcp_prefix(ip_port: str) -> str:
     if ip_port.startswith("tcp://"):
         return ip_port[len("tcp://") :]
     return ip_port
-
-
-def _env_flag(name: str, default: str = "0") -> bool:
-    return os.getenv(name, default).lower() in {"1", "true", "yes", "on"}
-
-
-def _debug_logging_enabled() -> bool:
-    return _env_flag(_SHMEM_DEBUG_ENV)
 
 
 def _get_block_dims() -> int:
@@ -65,8 +56,7 @@ def _build_weight_for_shmem(layer: torch.nn.Module) -> torch.Tensor:
 def prepare_shmem_matmul_allreduce(layer: torch.nn.Module) -> None:
     weight = getattr(layer, "weight", None)
     reason = None
-    expected_dtype = getattr(weight, "dtype", None)
-    kernel_name = _KERNEL_NAME_BY_DTYPE.get(expected_dtype)
+    kernel_name = _KERNEL_NAME_BY_DTYPE.get(getattr(weight, "dtype", None))
 
     if weight is None:
         reason = "missing_weight"
@@ -75,49 +65,13 @@ def prepare_shmem_matmul_allreduce(layer: torch.nn.Module) -> None:
     elif weight.ndim != 2:
         reason = "weight_rank_ne_2"
     elif kernel_name is None:
-        reason = f"unsupported_weight_dtype:{expected_dtype}"
+        reason = f"unsupported_weight_dtype:{getattr(weight, 'dtype', None)}"
 
     setattr(layer, "_shmem_static_reason", reason)
-    setattr(layer, "_shmem_expected_dtype", expected_dtype)
     setattr(layer, "_shmem_kernel_name", kernel_name)
     setattr(layer, "_shmem_block_dims", _get_block_dims())
-
-
-def _ensure_shmem_matmul_allreduce_prepared(layer: torch.nn.Module) -> None:
-    if hasattr(layer, "_shmem_static_reason"):
-        return
-    prepare_shmem_matmul_allreduce(layer)
-
-
-def _build_debug_details(layer: torch.nn.Module,
-                         input_parallel: torch.Tensor,
-                         expected_dtype: Optional[torch.dtype] = None) -> str:
-    weight = getattr(layer, "weight", None)
-    quant_method_name = getattr(layer, "_shmem_quant_method_name", "unknown")
-    num_rows = 0 if input_parallel.ndim == 0 else input_parallel.numel() // max(input_parallel.shape[-1], 1)
-    return (
-        f"prefix={getattr(layer, 'prefix', '')}, "
-        f"quant_method={quant_method_name}, "
-        f"num_rows={num_rows}, "
-        f"input_shape={tuple(input_parallel.shape)}, "
-        f"weight_shape={tuple(weight.shape) if weight is not None else ()}, "
-        f"expected_dtype={expected_dtype}, "
-        f"input_dtype={input_parallel.dtype}, "
-        f"weight_dtype={weight.dtype if weight is not None else 'None'}"
-    )
-
-
-def _log_skip_if_debug(layer: torch.nn.Module,
-                       input_parallel: torch.Tensor,
-                       reason: str,
-                       expected_dtype: Optional[torch.dtype] = None) -> None:
-    if not _debug_logging_enabled():
-        return
-    logger.info(
-        "Skipping shmem matmul-allreduce: reason=%s, %s",
-        reason,
-        _build_debug_details(layer, input_parallel, expected_dtype),
-    )
+    setattr(layer, "_shmem_kernel_entry", None)
+    setattr(layer, "_shmem_matmul_allreduce_weight_t", None)
 
 
 class _ShmemRuntime:
@@ -208,66 +162,49 @@ _RUNTIME = _ShmemRuntime()
 atexit.register(_RUNTIME.destroy)
 
 
+def finalize_shmem_matmul_allreduce(layer: torch.nn.Module) -> None:
+    if not getattr(layer, "_can_try_shmem_matmul_allreduce", False):
+        return
+
+    if getattr(layer, "_shmem_static_reason", None) is not None:
+        return
+
+    _build_weight_for_shmem(layer)
+    if getattr(layer, "_shmem_kernel_entry", None) is not None:
+        return
+    if _RUNTIME.ensure_initialized() is not None:
+        return
+    layer._shmem_kernel_entry = _RUNTIME.get_kernel_entry(
+        layer._shmem_block_dims, layer._shmem_kernel_name
+    )
+
+
 def maybe_shmem_matmul_allreduce(
     layer: torch.nn.Module,
     input_parallel: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
-) -> tuple[Optional[torch.Tensor], Optional[str]]:
-    _ensure_shmem_matmul_allreduce_prepared(layer)
-
-    expected_dtype = getattr(layer, "_shmem_expected_dtype", None)
+) -> Optional[torch.Tensor]:
     static_reason = getattr(layer, "_shmem_static_reason", None)
     if static_reason is not None:
-        _log_skip_if_debug(layer, input_parallel, static_reason, expected_dtype)
-        return None, static_reason
+        return None
 
-    if input_parallel.device.type != "npu":
-        reason = f"unsupported_input_device:{input_parallel.device.type}"
-        _log_skip_if_debug(layer, input_parallel, reason, expected_dtype)
-        return None, reason
-    if input_parallel.dtype != expected_dtype:
-        reason = f"unexpected_input_dtype:{input_parallel.dtype}"
-        _log_skip_if_debug(layer, input_parallel, reason, expected_dtype)
-        return None, reason
-    if input_parallel.ndim < 2:
-        reason = "input_rank_lt_2"
-        _log_skip_if_debug(layer, input_parallel, reason, expected_dtype)
-        return None, reason
+    weight_t = getattr(layer, "_shmem_matmul_allreduce_weight_t", None)
+    if weight_t is None:
+        return None
+    if input_parallel.shape[-1] != weight_t.shape[0]:
+        return None
 
-    weight = layer.weight
-    if input_parallel.shape[-1] != weight.shape[-1]:
-        reason = "input_weight_shape_mismatch"
-        _log_skip_if_debug(layer, input_parallel, reason, expected_dtype)
-        return None, reason
+    kernel_entry = getattr(layer, "_shmem_kernel_entry", None)
+    if kernel_entry is None:
+        return None
 
-    init_error = _RUNTIME.ensure_initialized()
-    if init_error is not None:
-        _log_skip_if_debug(layer, input_parallel, init_error, expected_dtype)
-        return None, init_error
+    if input_parallel.is_contiguous():
+        input_2d = input_parallel.reshape(-1, input_parallel.shape[-1])
+    else:
+        input_2d = input_parallel.contiguous().reshape(-1, input_parallel.shape[-1])
 
     try:
         stream_handle = _current_stream_handle()
-    except Exception as exc:
-        reason = f"current_stream_failed:{exc}"
-        _log_skip_if_debug(layer, input_parallel, reason, expected_dtype)
-        return None, reason
-
-    input_2d = input_parallel.contiguous().reshape(-1, input_parallel.shape[-1])
-
-    try:
-        weight_t = _build_weight_for_shmem(layer)
-        block_dims = layer._shmem_block_dims
-        kernel_name = layer._shmem_kernel_name
-        kernel_entry = _RUNTIME.get_kernel_entry(block_dims, kernel_name)
-        if kernel_entry is None:
-            reason = f"missing_shmem_kernel_entry:{kernel_name}"
-            _log_skip_if_debug(layer, input_parallel, reason, expected_dtype)
-            return None, reason
-        if _debug_logging_enabled():
-            logger.warning(
-                "Attempting shmem matmul-allreduce: %s",
-                _build_debug_details(layer, input_parallel, expected_dtype),
-            )
         output_2d = torch.empty(
             (input_2d.shape[0], weight_t.shape[1]),
             dtype=input_2d.dtype,
@@ -285,17 +222,8 @@ def maybe_shmem_matmul_allreduce(
         output = output_2d.reshape(*input_parallel.shape[:-1], weight_t.shape[1])
         if bias is not None:
             output = output + bias
-        if _debug_logging_enabled():
-            logger.info(
-                "Using shmem matmul-allreduce successfully: %s",
-                _build_debug_details(layer, input_parallel, expected_dtype),
-            )
-        return output, None
+        return output
     except Exception as exc:
-        reason = f"shmem_kernel_failed:{exc}"
-        logger.warning(
-            "shmem matmul-allreduce failed: reason=%s, %s",
-            reason,
-            _build_debug_details(layer, input_parallel, expected_dtype),
-        )
-        return None, reason
+        logger.warning("shmem matmul-allreduce failed for %s: %s",
+                       getattr(layer, "prefix", ""), exc)
+        return None

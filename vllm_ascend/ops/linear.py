@@ -39,7 +39,8 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.distributed import tensor_model_parallel_all_reduce
 
 from vllm_ascend.ops.linear_op import get_parallel_op, get_replicated_op
-from vllm_ascend.ops.shmem_runtime import prepare_shmem_matmul_allreduce
+from vllm_ascend.ops.shmem_runtime import (finalize_shmem_matmul_allreduce,
+                                           prepare_shmem_matmul_allreduce)
 from vllm_ascend.utils import enable_sp, maybe_trans_nz
 
 _SHMEM_ENABLED = (
@@ -83,6 +84,7 @@ class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
         super().process_weights_after_loading(layer)
         if "conv1d" not in layer.prefix:
             layer.weight.data = maybe_trans_nz(layer.weight.data)
+        finalize_shmem_matmul_allreduce(layer)
 
 
 # TODO(realliujiaxu): Remove this class after linear of vllm supports custom comm group
@@ -332,8 +334,6 @@ class AscendRowParallelLinear(RowParallelLinear):
         else:
             self.register_parameter("bias", None)
 
-        if _SHMEM_ENABLED:
-            prepare_shmem_matmul_allreduce(self)
         self._can_try_shmem_matmul_allreduce = (
             _SHMEM_ENABLED
             and reduce_results
@@ -341,6 +341,8 @@ class AscendRowParallelLinear(RowParallelLinear):
             and any(token in prefix for token in ("o_proj", "down_proj"))
             and "UnquantizedLinearMethod" in type(self.quant_method).__name__
         )
+        if self._can_try_shmem_matmul_allreduce:
+            prepare_shmem_matmul_allreduce(self)
         if self.custom_op is not None:
             self.custom_op.update_attrs()
 
