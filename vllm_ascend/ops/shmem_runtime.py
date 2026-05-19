@@ -16,7 +16,7 @@ _DEFAULT_IP_PORT = "tcp://127.0.0.1:8667"
 _CACHED_BLOCK_DIMS: Optional[int] = None
 _KERNEL_NAME_BY_DTYPE = {
     torch.float16: "shmem_matmul_allreduce",
-    torch.bfloat16: "shmem_matmul_allreduce_opt_bf16",
+    torch.bfloat16: "shmem_matmul_allreduce_tile_signal_bf16",
 }
 
 
@@ -224,6 +224,11 @@ def maybe_shmem_matmul_allreduce(
             output = output + bias
         return output
     except Exception as exc:
+        if (
+            getattr(layer, "_shmem_kernel_name", None)
+            == "shmem_matmul_allreduce_tile_signal_bf16"
+        ):
+            raise
         logger.warning("shmem matmul-allreduce failed for %s: %s",
                        getattr(layer, "prefix", ""), exc)
         return None
