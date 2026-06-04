@@ -290,7 +290,7 @@ def _shmem_matmul_allreduce_impl(input_parallel: torch.Tensor,
                                  layer_name: str) -> torch.Tensor:
     forward_context = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
-    bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+    bias_ = None if self.skip_bias_add else self.bias
     output = maybe_shmem_matmul_allreduce(self, input_parallel, bias_)
     if output is not None:
         return output
