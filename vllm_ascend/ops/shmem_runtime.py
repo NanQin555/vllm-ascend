@@ -1,6 +1,7 @@
 import atexit
 import importlib
 import os
+import re
 import threading
 from typing import Any, Optional
 
@@ -17,9 +18,24 @@ _DEFAULT_LOCAL_MEM_SIZE = 1024 * 1024 * 1024
 _DEFAULT_IP_PORT = "tcp://127.0.0.1:8667"
 _OUTPUT_BUFFER_ALIGNMENT = 512
 _CACHED_BLOCK_DIMS: Optional[int] = None
+_OWNER_BASE_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 _KERNEL_NAME_BY_DTYPE = {
     torch.bfloat16: "shmem_matmul_allreduce_overlap_bf16",
 }
+_AG_KERNEL_NAME_BY_DTYPE = {
+    torch.float16: "shmem_allgather_matmul",
+    torch.bfloat16: "shmem_allgather_matmul_bf16",
+}
+_RS_KERNEL_NAME_BY_DTYPE = {
+    torch.float16: "shmem_matmul_reduce_scatter",
+    torch.bfloat16: "shmem_matmul_reduce_scatter_bf16",
+}
+
+
+def shmem_sequence_parallel_enabled() -> bool:
+    return os.getenv(
+        "VLLM_ASCEND_ENABLE_SHMEM_SEQUENCE_PARALLEL", "0"
+    ).lower() in {"1", "true", "yes", "on"}
 
 
 def _strip_tcp_prefix(ip_port: str) -> str:
@@ -81,20 +97,41 @@ def _get_prealloc_output_tokens() -> int:
     return int(get_current_vllm_config().scheduler_config.max_num_batched_tokens)
 
 
+def _stable_owner_base(prefix: str) -> int:
+    configured = os.getenv("VLLM_ASCEND_SHMEM_OWNER_BASE")
+    if configured is not None and configured != "":
+        return int(configured)
+
+    match = _OWNER_BASE_LAYER_RE.search(prefix)
+    if match is not None:
+        op_offset = 1 if "down_proj" in prefix else 0
+        return int(match.group(1)) * 2 + op_offset
+
+    value = 2166136261
+    for byte in prefix.encode("utf-8"):
+        value ^= byte
+        value = (value * 16777619) & 0xffffffff
+    return value
+
+
 def _is_graph_capturing() -> bool:
     if not is_forward_context_available():
         return False
     return bool(getattr(get_forward_context(), "capturing", False))
 
 
-def _build_weight_for_shmem(layer: torch.nn.Module) -> torch.Tensor:
-    cached = getattr(layer, "_shmem_matmul_allreduce_weight_t", None)
+def _build_transposed_weight(layer: torch.nn.Module, attr_name: str) -> torch.Tensor:
+    cached = getattr(layer, attr_name, None)
     if cached is not None:
         return cached
 
     weight_t = layer.weight.transpose(0, 1).contiguous()
-    setattr(layer, "_shmem_matmul_allreduce_weight_t", weight_t)
+    setattr(layer, attr_name, weight_t)
     return weight_t
+
+
+def _build_weight_for_shmem(layer: torch.nn.Module) -> torch.Tensor:
+    return _build_transposed_weight(layer, "_shmem_matmul_allreduce_weight_t")
 
 
 def prepare_shmem_matmul_allreduce(layer: torch.nn.Module) -> None:
@@ -114,8 +151,37 @@ def prepare_shmem_matmul_allreduce(layer: torch.nn.Module) -> None:
     setattr(layer, "_shmem_static_reason", reason)
     setattr(layer, "_shmem_kernel_name", kernel_name)
     setattr(layer, "_shmem_block_dims", _get_block_dims())
+    prefix = str(getattr(layer, "unique_prefix", None) or getattr(layer, "prefix", ""))
+    setattr(layer, "_shmem_owner_base", _stable_owner_base(prefix))
     setattr(layer, "_shmem_kernel_entry", None)
     setattr(layer, "_shmem_matmul_allreduce_weight_t", None)
+
+
+def prepare_shmem_sequence_parallel(layer: torch.nn.Module, kind: str) -> None:
+    weight = getattr(layer, "weight", None)
+    reason = None
+    if kind == "allgather_matmul":
+        kernel_name = _AG_KERNEL_NAME_BY_DTYPE.get(getattr(weight, "dtype", None))
+    elif kind == "matmul_reduce_scatter":
+        kernel_name = _RS_KERNEL_NAME_BY_DTYPE.get(getattr(weight, "dtype", None))
+    else:
+        raise RuntimeError(f"unknown shmem sequence parallel kind: {kind}")
+
+    if weight is None:
+        reason = "missing_weight"
+    elif int(os.getenv("VLLM_ASCEND_ENABLE_NZ", "1")) == 2:
+        reason = "unsupported_nz_layout"
+    elif weight.ndim != 2:
+        reason = "weight_rank_ne_2"
+    elif kernel_name is None:
+        reason = f"unsupported_weight_dtype:{getattr(weight, 'dtype', None)}"
+
+    setattr(layer, "_shmem_sequence_static_reason", reason)
+    setattr(layer, "_shmem_sequence_kind", kind)
+    setattr(layer, "_shmem_sequence_kernel_name", kernel_name)
+    setattr(layer, "_shmem_sequence_block_dims", _get_block_dims())
+    setattr(layer, "_shmem_sequence_kernel_entry", None)
+    setattr(layer, "_shmem_sequence_weight_t", None)
 
 
 class _SymmetricOutputBuffer:
@@ -190,7 +256,9 @@ class _ShmemRuntime:
         self._shmem_operators = None
         self._operators: dict[int, object] = {}
         self._kernel_entries: dict[tuple[int, str], Any] = {}
-        self._output_buffers: dict[tuple[torch.dtype, str], _SymmetricOutputBuffer] = {}
+        self._output_buffers: dict[
+            tuple[torch.dtype, str, str], _SymmetricOutputBuffer
+        ] = {}
 
     def ensure_initialized(self) -> Optional[str]:
         with self._lock:
@@ -265,31 +333,35 @@ class _ShmemRuntime:
         shape: tuple[int, int],
         dtype: torch.dtype,
         device: torch.device,
+        purpose: str = "default",
     ) -> torch.Tensor:
         del layer
-        return self._get_symmetric_output(shape, dtype, device)
+        return self._get_symmetric_output(shape, dtype, device, purpose)
 
     def prepare_symmetric_output(
         self,
         shape: tuple[int, int],
         dtype: torch.dtype,
         device: torch.device,
+        purpose: str = "default",
     ) -> None:
-        self._prepare_symmetric_output(shape, dtype, device)
+        self._prepare_symmetric_output(shape, dtype, device, purpose)
 
     def _prepare_symmetric_output(
         self,
         shape: tuple[int, int],
         dtype: torch.dtype,
         device: torch.device,
+        purpose: str,
     ) -> None:
-        self._get_symmetric_output(shape, dtype, device)
+        self._get_symmetric_output(shape, dtype, device, purpose)
 
     def _get_symmetric_output(
         self,
         shape: tuple[int, int],
         dtype: torch.dtype,
         device: torch.device,
+        purpose: str,
     ) -> torch.Tensor:
         with self._lock:
             assert self._ash is not None
@@ -298,9 +370,30 @@ class _ShmemRuntime:
             if device_id is None:
                 device_id = torch.npu.current_device()
             normalized_device = torch.device(f"npu:{device_id}")
-            key = (dtype, str(normalized_device))
+            key = (dtype, str(normalized_device), purpose)
             requested_bytes = _tensor_nbytes(shape, dtype)
             buffer = self._output_buffers.get(key)
+            if buffer is not None and requested_bytes > buffer.buffer_bytes:
+                if _is_graph_capturing():
+                    raise RuntimeError(
+                        "shmem output shape exceeds fixed buffer capacity "
+                        "during graph capture: "
+                        f"requested_bytes={requested_bytes} "
+                        f"buffer_bytes={buffer.buffer_bytes}. "
+                        "Run a non-graph warmup for the maximum captured "
+                        "shape, or set VLLM_ASCEND_SHMEM_OUTPUT_BUFFER_BYTES."
+                    )
+                logger.info(
+                    "Growing shmem output buffer: dtype=%s device=%s "
+                    "purpose=%s old_buffer_bytes=%s requested_bytes=%s",
+                    dtype,
+                    normalized_device,
+                    purpose,
+                    buffer.buffer_bytes,
+                    requested_bytes,
+                )
+                buffer.free()
+                buffer = None
             if buffer is None:
                 if _is_graph_capturing():
                     raise RuntimeError(
@@ -372,6 +465,43 @@ def finalize_shmem_matmul_allreduce(layer: torch.nn.Module) -> None:
     )
 
 
+def finalize_shmem_sequence_parallel(layer: torch.nn.Module) -> None:
+    if not getattr(layer, "_can_try_shmem_sequence_parallel", False):
+        return
+
+    if getattr(layer, "_shmem_sequence_static_reason", None) is not None:
+        return
+
+    weight_t = _build_transposed_weight(layer, "_shmem_sequence_weight_t")
+    if getattr(layer, "_shmem_sequence_kernel_entry", None) is not None:
+        return
+    if _RUNTIME.ensure_initialized() is not None:
+        return
+
+    layer._shmem_sequence_kernel_entry = _RUNTIME.get_kernel_entry(
+        layer._shmem_sequence_block_dims,
+        layer._shmem_sequence_kernel_name,
+    )
+
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    max_tokens = _get_prealloc_output_tokens()
+    local_tokens = (max_tokens + world_size - 1) // world_size
+    padded_tokens = local_tokens * world_size
+    if layer._shmem_sequence_kind == "allgather_matmul":
+        output_shape = (padded_tokens, int(weight_t.shape[1]))
+        purpose = "sp_allgather_matmul"
+    else:
+        output_shape = (local_tokens, int(weight_t.shape[1]))
+        purpose = "sp_matmul_reduce_scatter"
+
+    _RUNTIME.prepare_symmetric_output(
+        output_shape,
+        weight_t.dtype,
+        weight_t.device,
+        purpose,
+    )
+
+
 def maybe_shmem_matmul_allreduce(
     layer: torch.nn.Module,
     input_parallel: torch.Tensor,
@@ -420,6 +550,7 @@ def maybe_shmem_matmul_allreduce(
         weight_t.shape[1],
         input_2d.shape[1],
         stream_handle,
+        int(getattr(layer, "_shmem_owner_base", 0xffffffff)),
     )
     if bias is not None:
         raise RuntimeError(
@@ -427,3 +558,125 @@ def maybe_shmem_matmul_allreduce(
             "and does not support fused bias"
         )
     return output_2d.reshape(*input_parallel.shape[:-1], weight_t.shape[1])
+
+
+def _get_sequence_weight(layer: torch.nn.Module) -> torch.Tensor:
+    weight_t = getattr(layer, "_shmem_sequence_weight_t", None)
+    if weight_t is None:
+        raise RuntimeError("shmem sequence-parallel weight is not finalized")
+    return weight_t
+
+
+def _get_sequence_kernel(layer: torch.nn.Module):
+    static_reason = getattr(layer, "_shmem_sequence_static_reason", None)
+    if static_reason is not None:
+        raise RuntimeError(f"shmem sequence parallel disabled: {static_reason}")
+
+    kernel_entry = getattr(layer, "_shmem_sequence_kernel_entry", None)
+    if kernel_entry is None:
+        raise RuntimeError("shmem sequence-parallel kernel entry is not initialized")
+    return kernel_entry
+
+
+def maybe_shmem_allgather_matmul(
+    layer: torch.nn.Module,
+    input_local: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    weight_t = _get_sequence_weight(layer)
+    if input_local.dtype != weight_t.dtype:
+        raise RuntimeError(
+            "shmem allgather-matmul requires input and weight to use the "
+            f"same dtype: input_dtype={input_local.dtype} weight_dtype={weight_t.dtype}"
+        )
+    if input_local.shape[-1] != weight_t.shape[0]:
+        raise RuntimeError(
+            "shmem allgather-matmul input/weight shape mismatch: "
+            f"input_k={input_local.shape[-1]} weight_k={weight_t.shape[0]}"
+        )
+    if bias is not None:
+        raise RuntimeError("shmem allgather-matmul does not support fused bias")
+
+    kernel_entry = _get_sequence_kernel(layer)
+    input_2d = input_local.reshape(-1, input_local.shape[-1])
+    if not input_2d.is_contiguous():
+        input_2d = input_2d.contiguous()
+
+    world_size = dist.get_world_size()
+    output_rows = input_2d.shape[0] * world_size
+    output_2d = _RUNTIME.get_symmetric_output(
+        layer,
+        (output_rows, weight_t.shape[1]),
+        input_2d.dtype,
+        input_2d.device,
+        "sp_allgather_matmul",
+    )
+    kernel_entry(
+        input_2d.data_ptr(),
+        weight_t.data_ptr(),
+        output_2d.data_ptr(),
+        input_2d.shape[0],
+        weight_t.shape[1],
+        input_2d.shape[1],
+        _current_stream_handle(),
+    )
+
+    try:
+        forward_context = get_forward_context()
+        pad_size = int(getattr(forward_context, "pad_size", 0))
+    except AssertionError:
+        pad_size = 0
+    if pad_size > 0:
+        output_2d = output_2d[:-pad_size]
+        output_rows -= pad_size
+    return output_2d.reshape(output_rows, weight_t.shape[1])
+
+
+def maybe_shmem_matmul_reduce_scatter(
+    layer: torch.nn.Module,
+    input_parallel: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    weight_t = _get_sequence_weight(layer)
+    if input_parallel.dtype != weight_t.dtype:
+        raise RuntimeError(
+            "shmem matmul-reduce-scatter requires input and weight to use the "
+            f"same dtype: input_dtype={input_parallel.dtype} weight_dtype={weight_t.dtype}"
+        )
+    if input_parallel.shape[-1] != weight_t.shape[0]:
+        raise RuntimeError(
+            "shmem matmul-reduce-scatter input/weight shape mismatch: "
+            f"input_k={input_parallel.shape[-1]} weight_k={weight_t.shape[0]}"
+        )
+
+    kernel_entry = _get_sequence_kernel(layer)
+    input_2d = input_parallel.reshape(-1, input_parallel.shape[-1])
+    if not input_2d.is_contiguous():
+        input_2d = input_2d.contiguous()
+
+    world_size = dist.get_world_size()
+    if input_2d.shape[0] % world_size != 0:
+        raise RuntimeError(
+            "shmem matmul-reduce-scatter requires token count divisible by "
+            f"world_size: tokens={input_2d.shape[0]} world_size={world_size}"
+        )
+    output_rows = input_2d.shape[0] // world_size
+    output_2d = _RUNTIME.get_symmetric_output(
+        layer,
+        (output_rows, weight_t.shape[1]),
+        input_2d.dtype,
+        input_2d.device,
+        "sp_matmul_reduce_scatter",
+    )
+    kernel_entry(
+        input_2d.data_ptr(),
+        weight_t.data_ptr(),
+        output_2d.data_ptr(),
+        input_2d.shape[0],
+        weight_t.shape[1],
+        input_2d.shape[1],
+        _current_stream_handle(),
+    )
+    if bias is not None:
+        output_2d = output_2d + bias
+    return output_2d.reshape(output_rows, weight_t.shape[1])

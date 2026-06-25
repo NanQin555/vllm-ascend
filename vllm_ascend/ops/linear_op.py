@@ -37,6 +37,7 @@ How to extend a new linear op? Taking column parallel op as an example:
 Row parallel op follows a similar approach - inherit from RowColumnParallelOp and register the new class in get_row_parallel_op.
 """
 
+import os
 import re
 from functools import lru_cache
 from types import SimpleNamespace
@@ -66,6 +67,20 @@ from vllm_ascend.utils import (enable_dsa_cp, enable_dsa_cp_with_layer_shard, en
                                get_flashcomm2_reorgnized_batch_ids,
                                matmul_allreduce_enable, mlp_tp_enable,
                                oproj_tp_enable, shared_expert_dp_enabled)
+
+
+def shmem_sequence_parallel_enable() -> bool:
+    return os.getenv(
+        "VLLM_ASCEND_ENABLE_SHMEM_SEQUENCE_PARALLEL", "0"
+    ).lower() in {"1", "true", "yes", "on"}
+
+
+def _is_shmem_sp_column_target(prefix: str) -> bool:
+    return any(token in prefix for token in ("qkv_proj", "gate_up_proj"))
+
+
+def _is_shmem_sp_row_target(prefix: str) -> bool:
+    return any(token in prefix for token in ("o_proj", "down_proj"))
 
 
 class CustomLinearOp:
@@ -460,6 +475,9 @@ class MatmulAllreduceRowParallelOp(CustomRowParallelOp):
 
 
 class SequenceColumnParallelOp(CustomColumnParallelOp):
+    def __init__(self, layer):
+        super().__init__(layer)
+        self.unique_prefix = None
 
     def apply_impl(
         self, input_: torch.Tensor
@@ -475,6 +493,23 @@ class SequenceColumnParallelOp(CustomColumnParallelOp):
         # Matrix multiply.
         assert self.quant_method is not None
 
+        output_bias = self.bias if self.skip_bias_add else None
+        try:
+            sp_enabled = get_forward_context().sp_enabled
+        except AssertionError:
+            sp_enabled = False
+        if (sp_enabled
+                and getattr(self.layer, "_can_try_shmem_sequence_parallel", False)):
+            output = torch.ops.vllm.shmem_allgather_matmul(
+                input_, self.unique_prefix)
+            return output, output_bias
+        if (sp_enabled
+                and shmem_sequence_parallel_enable()
+                and _is_shmem_sp_column_target(self.layer.prefix)):
+            raise RuntimeError(
+                "shmem sequence-parallel allgather-matmul was requested but "
+                f"layer is not prepared for shmem: prefix={self.layer.prefix}")
+
         input_ = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(input_, True)
         output_parallel = self.quant_method.apply(self.layer, input_, bias)
 
@@ -483,8 +518,11 @@ class SequenceColumnParallelOp(CustomColumnParallelOp):
             output = self.comm_group.all_gather(output_parallel)
         else:
             output = output_parallel
-        output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
+
+    def update_attrs(self):
+        super().update_attrs()
+        self.unique_prefix = self.layer.unique_prefix
 
 
 class Flashcomm2OshardQKVParallelOp(CustomColumnParallelOp):
@@ -582,6 +620,15 @@ class SequenceRowParallelOp(CustomRowParallelOp):
 
         world_size = self.layer.tp_size
         comm_mode = "aiv"
+        if getattr(self.layer, "_can_try_shmem_sequence_parallel", False):
+            return torch.ops.vllm.shmem_matmul_reduce_scatter(
+                x, self.unique_prefix)
+        if (shmem_sequence_parallel_enable()
+                and _is_shmem_sp_row_target(self.layer.prefix)):
+            raise RuntimeError(
+                "shmem sequence-parallel matmul-reduce-scatter was requested "
+                f"but layer is not prepared for shmem: prefix={self.layer.prefix}")
+
         hcom_name = get_tp_group().device_group._get_backend(
             torch.device('npu')).get_hccl_comm_name(self.layer.tp_rank)
 
@@ -736,6 +783,18 @@ def _get_row_parallel_op(
         return MLPRowParallelOp(layer)
     if "o_proj" in prefix and oproj_tp_enable():
         return OProjRowParallelOp(layer)
+
+    sp_row_prefixes = [
+        "o_proj",  # attn output linear of most LLMs
+        "out_proj",  # attn output linear of Qwen3 Next
+        "down_proj",  # second MLP of most LLMs
+        "attention.dense",  # attn output linear of Bailing
+    ]
+    if shmem_sequence_parallel_enable() and enable_sp():
+        if "shared_expert" in prefix:
+            return None
+        if _is_shmem_sp_row_target(prefix):
+            return SequenceRowParallelOp(layer)
     if matmul_allreduce_enable():
         return MatmulAllreduceRowParallelOp(layer)
     if flashcomm2_enable():
@@ -744,12 +803,6 @@ def _get_row_parallel_op(
     if enable_sp():
         if "shared_expert" in prefix:
             return None
-        sp_row_prefixes = [
-            "o_proj",  # attn output linear of most LLMs
-            "out_proj",  # attn output linear of Qwen3 Next
-            "down_proj",  # second MLP of most LLMs
-            "attention.dense",  # attn output linear of Bailing
-        ]
         for a_prefix in sp_row_prefixes:
             if a_prefix in prefix:
                 return SequenceRowParallelOp(layer)

@@ -12,7 +12,11 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_forward_context import MoECommType
-from vllm_ascend.ops.shmem_runtime import maybe_shmem_matmul_allreduce
+from vllm_ascend.ops.shmem_runtime import (
+    maybe_shmem_allgather_matmul,
+    maybe_shmem_matmul_allreduce,
+    maybe_shmem_matmul_reduce_scatter,
+)
 from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
 from vllm_ascend.utils import npu_stream_switch, prefetch_stream
 from typing import Optional, Tuple
@@ -312,6 +316,51 @@ def _shmem_matmul_allreduce_impl_fake(input_parallel: torch.Tensor,
                        dtype=input_parallel.dtype)
 
 
+def _shmem_allgather_matmul_impl(input_local: torch.Tensor,
+                                 layer_name: str) -> torch.Tensor:
+    forward_context = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    bias_ = None if self.skip_bias_add else self.bias
+    return maybe_shmem_allgather_matmul(self, input_local, bias_)
+
+
+def _shmem_allgather_matmul_impl_fake(input_local: torch.Tensor,
+                                      layer_name: str) -> torch.Tensor:
+    forward_context = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    num_tokens = input_local.size(0)
+    if forward_context.sp_enabled:
+        num_tokens *= self.tp_size
+        pad_size = getattr(forward_context, "pad_size", 0)
+        if pad_size > 0:
+            num_tokens -= pad_size
+    output_shape = (num_tokens, self.output_size_per_partition)
+    return torch.empty(size=output_shape,
+                       device=input_local.device,
+                       dtype=input_local.dtype)
+
+
+def _shmem_matmul_reduce_scatter_impl(input_parallel: torch.Tensor,
+                                      layer_name: str) -> torch.Tensor:
+    forward_context = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+    return maybe_shmem_matmul_reduce_scatter(self, input_parallel, bias_)
+
+
+def _shmem_matmul_reduce_scatter_impl_fake(input_parallel: torch.Tensor,
+                                           layer_name: str) -> torch.Tensor:
+    forward_context = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    num_tokens = input_parallel.size(0)
+    if forward_context.sp_enabled:
+        num_tokens = num_tokens // self.tp_size
+    output_shape = (num_tokens, self.output_size_per_partition)
+    return torch.empty(size=output_shape,
+                       device=input_parallel.device,
+                       dtype=input_parallel.dtype)
+
+
 # TODO(Angazenn): The reason why we use a custom op to encapsulate npu_quantize
 # is that aclnnAscendQuantV3(npu_quantize) use div_mode=False, while
 # aclnnAddRmsNormQuantV2(npu_add_rms_norm_quant) use div_moe=True. We have to
@@ -403,6 +452,18 @@ direct_register_custom_op(op_name="matmul_and_reduce",
 direct_register_custom_op(op_name="shmem_matmul_allreduce",
                           op_func=_shmem_matmul_allreduce_impl,
                           fake_impl=_shmem_matmul_allreduce_impl_fake,
+                          mutates_args=[],
+                          dispatch_key="PrivateUse1")
+
+direct_register_custom_op(op_name="shmem_allgather_matmul",
+                          op_func=_shmem_allgather_matmul_impl,
+                          fake_impl=_shmem_allgather_matmul_impl_fake,
+                          mutates_args=[],
+                          dispatch_key="PrivateUse1")
+
+direct_register_custom_op(op_name="shmem_matmul_reduce_scatter",
+                          op_func=_shmem_matmul_reduce_scatter_impl,
+                          fake_impl=_shmem_matmul_reduce_scatter_impl_fake,
                           mutates_args=[],
                           dispatch_key="PrivateUse1")
 

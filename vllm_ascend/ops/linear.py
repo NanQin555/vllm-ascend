@@ -39,8 +39,13 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.distributed import tensor_model_parallel_all_reduce
 
 from vllm_ascend.ops.linear_op import get_parallel_op, get_replicated_op
-from vllm_ascend.ops.shmem_runtime import (finalize_shmem_matmul_allreduce,
-                                           prepare_shmem_matmul_allreduce)
+from vllm_ascend.ops.shmem_runtime import (
+    finalize_shmem_matmul_allreduce,
+    finalize_shmem_sequence_parallel,
+    prepare_shmem_matmul_allreduce,
+    prepare_shmem_sequence_parallel,
+    shmem_sequence_parallel_enabled,
+)
 from vllm_ascend.utils import enable_sp, maybe_trans_nz
 
 _SHMEM_ENABLED = (
@@ -85,6 +90,7 @@ class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
         if "conv1d" not in layer.prefix:
             layer.weight.data = maybe_trans_nz(layer.weight.data)
         finalize_shmem_matmul_allreduce(layer)
+        finalize_shmem_sequence_parallel(layer)
 
 
 # TODO(realliujiaxu): Remove this class after linear of vllm supports custom comm group
@@ -343,6 +349,16 @@ class AscendRowParallelLinear(RowParallelLinear):
         )
         if self._can_try_shmem_matmul_allreduce:
             prepare_shmem_matmul_allreduce(self)
+        self._can_try_shmem_sequence_parallel = (
+            shmem_sequence_parallel_enabled()
+            and enable_sp()
+            and reduce_results
+            and self.tp_size > 1
+            and any(token in prefix for token in ("o_proj", "down_proj"))
+            and "UnquantizedLinearMethod" in type(self.quant_method).__name__
+        )
+        if self._can_try_shmem_sequence_parallel:
+            prepare_shmem_sequence_parallel(self, "matmul_reduce_scatter")
         if self.custom_op is not None:
             self.custom_op.update_attrs()
 
@@ -404,6 +420,17 @@ class AscendColumnParallelLinear(ColumnParallelLinear):
         return_bias: bool = True,
         disable_tp: bool = False,
     ):
+        self.unique_prefix = prefix
+        if shmem_sequence_parallel_enabled() and enable_sp():
+            compilation_config = get_current_vllm_config().compilation_config
+            if prefix in compilation_config.static_forward_context:
+                self.unique_prefix = (
+                    f"{prefix}.unique_prefix"
+                    f"{AscendRowParallelLinear.unique_prefix_idx}"
+                )
+                AscendRowParallelLinear.unique_prefix_idx += 1
+            compilation_config.static_forward_context[self.unique_prefix] = self
+
         self.custom_op, self.tp_rank, self.tp_size = get_parallel_op(
             disable_tp, prefix, self, "column")
         # TODO(realliujiaxu): Replace the initialization code below with super().__init__ after linear of vllm supports custom comm group
@@ -453,6 +480,17 @@ class AscendColumnParallelLinear(ColumnParallelLinear):
             })
         else:
             self.register_parameter("bias", None)
+
+        self._can_try_shmem_sequence_parallel = (
+            shmem_sequence_parallel_enabled()
+            and enable_sp()
+            and self.tp_size > 1
+            and not gather_output
+            and any(token in prefix for token in ("qkv_proj", "gate_up_proj"))
+            and "UnquantizedLinearMethod" in type(self.quant_method).__name__
+        )
+        if self._can_try_shmem_sequence_parallel:
+            prepare_shmem_sequence_parallel(self, "allgather_matmul")
 
         if self.custom_op is not None:
             self.custom_op.update_attrs()
