@@ -35,6 +35,7 @@ from vllm.model_executor.layers.quantization.base_config import \
     QuantizationConfig
 from vllm.model_executor.utils import set_weight_attrs
 
+from vllm_ascend.ops.layerwise_profile import maybe_profile_linear
 from vllm_ascend.ops.linear_op import get_parallel_op, get_replicated_op
 from vllm_ascend.utils import enable_sp, maybe_trans_nz
 
@@ -155,9 +156,20 @@ class AscendQKVParallelLinear(QKVParallelLinear):
         input_,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         if self.custom_op is not None:
-            return self.custom_op.apply(input_)
+            return maybe_profile_linear(
+                self.prefix,
+                type(self).__name__,
+                input_,
+                lambda: self.custom_op.apply(input_),
+            )
 
-        return super().forward(input_)
+        parent_forward = super().forward
+        return maybe_profile_linear(
+            self.prefix,
+            type(self).__name__,
+            input_,
+            lambda: parent_forward(input_),
+        )
 
 
 class AscendMergedColumnParallelLinear(MergedColumnParallelLinear):
@@ -208,9 +220,20 @@ class AscendMergedColumnParallelLinear(MergedColumnParallelLinear):
         input_,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         if self.custom_op is not None:
-            return self.custom_op.apply(input_)
+            return maybe_profile_linear(
+                self.prefix,
+                type(self).__name__,
+                input_,
+                lambda: self.custom_op.apply(input_),
+            )
 
-        return super().forward(input_)
+        parent_forward = super().forward
+        return maybe_profile_linear(
+            self.prefix,
+            type(self).__name__,
+            input_,
+            lambda: parent_forward(input_),
+        )
 
 
 class AscendRowParallelLinear(RowParallelLinear):
@@ -238,6 +261,7 @@ class AscendRowParallelLinear(RowParallelLinear):
         disable_tp: bool = False,
     ):
         # TODO(kunpengW-code): Specifying the prefix in linear layers of some models in the vLLM.
+        self.unique_prefix = prefix
         if enable_sp():
             compilation_config = get_current_vllm_config().compilation_config
             unique_prefix = prefix
@@ -302,9 +326,20 @@ class AscendRowParallelLinear(RowParallelLinear):
         **kwargs,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         if self.custom_op is not None:
-            return self.custom_op.apply(input_)
+            return maybe_profile_linear(
+                self.unique_prefix,
+                type(self).__name__,
+                input_,
+                lambda: self.custom_op.apply(input_),
+            )
 
-        return super().forward(input_)
+        parent_forward = super().forward
+        return maybe_profile_linear(
+            self.unique_prefix,
+            type(self).__name__,
+            input_,
+            lambda: parent_forward(input_),
+        )
 
 
 class AscendColumnParallelLinear(ColumnParallelLinear):
@@ -387,9 +422,20 @@ class AscendColumnParallelLinear(ColumnParallelLinear):
         input_,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         if self.custom_op is not None:
-            return self.custom_op.apply(input_)
+            return maybe_profile_linear(
+                self.prefix,
+                type(self).__name__,
+                input_,
+                lambda: self.custom_op.apply(input_),
+            )
 
-        return super().forward(input_)
+        parent_forward = super().forward
+        return maybe_profile_linear(
+            self.prefix,
+            type(self).__name__,
+            input_,
+            lambda: parent_forward(input_),
+        )
 
 
 class AscendReplicatedLinear(ReplicatedLinear):
@@ -465,6 +511,17 @@ class AscendReplicatedLinear(ReplicatedLinear):
         input_,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         if self.custom_op is not None:
-            return self.custom_op.apply(input_)
+            return maybe_profile_linear(
+                self.prefix,
+                type(self).__name__,
+                input_,
+                lambda: self.custom_op.apply(input_),
+            )
 
-        return super().forward(input_)
+        parent_forward = super().forward
+        return maybe_profile_linear(
+            self.prefix,
+            type(self).__name__,
+            input_,
+            lambda: parent_forward(input_),
+        )
