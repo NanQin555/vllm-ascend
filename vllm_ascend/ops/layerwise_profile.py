@@ -15,6 +15,10 @@ _ENABLED = (
     os.getenv("VLLM_ASCEND_LAYER_PROFILE", "0").lower()
     in {"1", "true", "yes", "on"}
 )
+_DISABLE_IN_GRAPH = (
+    os.getenv("VLLM_ASCEND_LAYER_PROFILE_DISABLE_IN_GRAPH", "1").lower()
+    in {"1", "true", "yes", "on"}
+)
 _OUTPUT_DIR = os.getenv("VLLM_ASCEND_LAYER_PROFILE_DIR", "")
 _WRITE_LOCK = threading.Lock()
 _LAYER_RE = re.compile(r"(?:^|\.)(?:model\.)?layers\.(\d+)(?:\.|$)")
@@ -25,6 +29,45 @@ def _get_rank() -> int:
         return int(dist.get_rank())
     rank = os.getenv("RANK")
     return int(rank) if rank is not None else -1
+
+
+def _is_compiling() -> bool:
+    compiler = getattr(torch, "compiler", None)
+    if compiler is not None:
+        is_compiling = getattr(compiler, "is_compiling", None)
+        if callable(is_compiling):
+            try:
+                if bool(is_compiling()):
+                    return True
+            except Exception:
+                pass
+
+    dynamo = getattr(torch, "_dynamo", None)
+    if dynamo is not None:
+        is_compiling = getattr(dynamo, "is_compiling", None)
+        if callable(is_compiling):
+            try:
+                if bool(is_compiling()):
+                    return True
+            except Exception:
+                pass
+
+    return False
+
+
+def _is_graph_runtime_active() -> bool:
+    if _DISABLE_IN_GRAPH and _is_compiling():
+        return True
+
+    try:
+        forward_context = get_forward_context()
+    except AssertionError:
+        return False
+
+    if _DISABLE_IN_GRAPH and bool(getattr(forward_context, "capturing", False)):
+        return True
+
+    return False
 
 
 def _get_phase_and_num_tokens(input_tensor: Optional[torch.Tensor]) -> tuple[str, int]:
@@ -106,7 +149,7 @@ def maybe_profile_linear(
     input_tensor: Optional[torch.Tensor],
     run: Callable[[], Any],
 ) -> Any:
-    if not _ENABLED:
+    if not _ENABLED or _is_graph_runtime_active():
         return run()
 
     result, elapsed_us = _measure_elapsed_us(run)
