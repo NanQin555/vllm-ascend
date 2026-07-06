@@ -38,6 +38,7 @@ from vllm.model_executor.layers.quantization.base_config import \
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.distributed import tensor_model_parallel_all_reduce
 
+from vllm_ascend.ops.layerwise_profile_overlap import maybe_profile_linear
 from vllm_ascend.ops.linear_op import get_parallel_op, get_replicated_op
 from vllm_ascend.ops.shmem_runtime import (finalize_shmem_matmul_allreduce,
                                            prepare_shmem_matmul_allreduce)
@@ -194,9 +195,20 @@ class AscendQKVParallelLinear(QKVParallelLinear):
         input_,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         if self.custom_op is not None:
-            return self.custom_op.apply(input_)
+            return maybe_profile_linear(
+                self.prefix,
+                type(self).__name__,
+                input_,
+                lambda: self.custom_op.apply(input_),
+            )
 
-        return super().forward(input_)
+        parent_forward = super().forward
+        return maybe_profile_linear(
+            self.prefix,
+            type(self).__name__,
+            input_,
+            lambda: parent_forward(input_),
+        )
 
 
 class AscendMergedColumnParallelLinear(MergedColumnParallelLinear):
@@ -247,9 +259,20 @@ class AscendMergedColumnParallelLinear(MergedColumnParallelLinear):
         input_,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         if self.custom_op is not None:
-            return self.custom_op.apply(input_)
+            return maybe_profile_linear(
+                self.prefix,
+                type(self).__name__,
+                input_,
+                lambda: self.custom_op.apply(input_),
+            )
 
-        return super().forward(input_)
+        parent_forward = super().forward
+        return maybe_profile_linear(
+            self.prefix,
+            type(self).__name__,
+            input_,
+            lambda: parent_forward(input_),
+        )
 
 
 class AscendRowParallelLinear(RowParallelLinear):
@@ -352,34 +375,47 @@ class AscendRowParallelLinear(RowParallelLinear):
         **kwargs,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         if self.custom_op is not None:
-            return self.custom_op.apply(input_)
-
-        if self.input_is_parallel:
-            input_parallel = input_
-        else:
-            splitted_input = split_tensor_along_last_dim(
-                input_, num_partitions=self.tp_size
+            return maybe_profile_linear(
+                self.unique_prefix,
+                type(self).__name__,
+                input_,
+                lambda: self.custom_op.apply(input_),
             )
-            input_parallel = splitted_input[self.tp_rank].contiguous()
 
-        assert self.quant_method is not None
-
-        if self._can_try_shmem_matmul_allreduce:
-            output = torch.ops.vllm.shmem_matmul_allreduce(
-                input_parallel, self.unique_prefix
-            )
-        else:
-            bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-            output_parallel = self.quant_method.apply(self, input_parallel, bias_)
-            if self.reduce_results and self.tp_size > 1:
-                output = tensor_model_parallel_all_reduce(output_parallel)
+        def run_row_parallel():
+            if self.input_is_parallel:
+                input_parallel = input_
             else:
-                output = output_parallel
+                splitted_input = split_tensor_along_last_dim(
+                    input_, num_partitions=self.tp_size
+                )
+                input_parallel = splitted_input[self.tp_rank].contiguous()
 
-        if not self.return_bias:
-            return output
-        output_bias = self.bias if self.skip_bias_add else None
-        return output, output_bias
+            assert self.quant_method is not None
+
+            if self._can_try_shmem_matmul_allreduce:
+                output = torch.ops.vllm.shmem_matmul_allreduce(
+                    input_parallel, self.unique_prefix
+                )
+            else:
+                bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+                output_parallel = self.quant_method.apply(self, input_parallel, bias_)
+                if self.reduce_results and self.tp_size > 1:
+                    output = tensor_model_parallel_all_reduce(output_parallel)
+                else:
+                    output = output_parallel
+
+            if not self.return_bias:
+                return output
+            output_bias = self.bias if self.skip_bias_add else None
+            return output, output_bias
+
+        return maybe_profile_linear(
+            self.unique_prefix,
+            type(self).__name__,
+            input_,
+            run_row_parallel,
+        )
 
 
 class AscendColumnParallelLinear(ColumnParallelLinear):
@@ -462,9 +498,20 @@ class AscendColumnParallelLinear(ColumnParallelLinear):
         input_,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         if self.custom_op is not None:
-            return self.custom_op.apply(input_)
+            return maybe_profile_linear(
+                self.prefix,
+                type(self).__name__,
+                input_,
+                lambda: self.custom_op.apply(input_),
+            )
 
-        return super().forward(input_)
+        parent_forward = super().forward
+        return maybe_profile_linear(
+            self.prefix,
+            type(self).__name__,
+            input_,
+            lambda: parent_forward(input_),
+        )
 
 
 class AscendReplicatedLinear(ReplicatedLinear):
@@ -540,6 +587,17 @@ class AscendReplicatedLinear(ReplicatedLinear):
         input_,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         if self.custom_op is not None:
-            return self.custom_op.apply(input_)
+            return maybe_profile_linear(
+                self.prefix,
+                type(self).__name__,
+                input_,
+                lambda: self.custom_op.apply(input_),
+            )
 
-        return super().forward(input_)
+        parent_forward = super().forward
+        return maybe_profile_linear(
+            self.prefix,
+            type(self).__name__,
+            input_,
+            lambda: parent_forward(input_),
+        )
