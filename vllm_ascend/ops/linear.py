@@ -375,12 +375,7 @@ class AscendRowParallelLinear(RowParallelLinear):
         **kwargs,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         if self.custom_op is not None:
-            return maybe_profile_linear(
-                self.unique_prefix,
-                type(self).__name__,
-                input_,
-                lambda: self.custom_op.apply(input_),
-            )
+            return self.custom_op.apply(input_)
 
         def run_row_parallel():
             if self.input_is_parallel:
@@ -409,6 +404,9 @@ class AscendRowParallelLinear(RowParallelLinear):
                 return output
             output_bias = self.bias if self.skip_bias_add else None
             return output, output_bias
+
+        if self._can_try_shmem_matmul_allreduce:
+            return run_row_parallel()
 
         return maybe_profile_linear(
             self.unique_prefix,

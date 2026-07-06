@@ -164,8 +164,12 @@ def maybe_profile_linear(
     module_name: str,
     input_tensor: Optional[torch.Tensor],
     run: Callable[[], Any],
+    ignore_graph_guard: bool = False,
 ) -> Any:
-    if not _ENABLED or _is_graph_runtime_active():
+    if not _ENABLED:
+        return run()
+
+    if not ignore_graph_guard and _is_graph_runtime_active():
         return run()
 
     result, elapsed_us = _measure_elapsed_us(run)
