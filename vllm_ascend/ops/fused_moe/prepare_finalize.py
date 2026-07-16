@@ -302,6 +302,52 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
         return hidden_states, router_logits, mc2_mask, context_metadata
 
 
+class PrepareAndFinalizeWithShmem(PrepareAndFinalizeWithAll2All):
+    """Equal-size TP slicing required by the experimental SHMEM collective.
+
+    Unlike the generic All2All path, every SHMEM rank must enter the single
+    fused kernel with the same M because its barriers and symmetric offsets are
+    derived from one common shape.
+    """
+
+    def prepare(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        enable_shared_expert_dp: bool = False,
+        replace_allreduce: bool = False,
+        quant_type=QuantType.NONE,
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor],
+               Optional[torch.Tensor]]:
+        if enable_shared_expert_dp or replace_allreduce:
+            raise RuntimeError(
+                "SHMEM MoE does not yet support shared-expert DP or sequence "
+                "parallel replacement")
+        if quant_type != QuantType.NONE:
+            raise RuntimeError("SHMEM MoE only supports unquantized BF16")
+
+        self.replace_allreduce = False
+        self.enable_shared_expert_dp = False
+        self.num_tokens = hidden_states.shape[0]
+        pad_size = (-self.num_tokens) % self.tp_size
+        if pad_size > 0:
+            hidden_states = nn.functional.pad(hidden_states,
+                                              (0, 0, 0, pad_size))
+            router_logits = nn.functional.pad(router_logits,
+                                              (0, 0, 0, pad_size))
+
+        padded_hidden_states_shape = hidden_states.shape
+        if self.tp_size > 1:
+            hidden_states = torch.tensor_split(
+                hidden_states, self.tp_size, dim=0)[self.tp_rank]
+            router_logits = torch.tensor_split(
+                router_logits, self.tp_size, dim=0)[self.tp_rank]
+
+        return hidden_states, router_logits, None, {
+            "padded_hidden_states_shape": padded_hidden_states_shape
+        }
+
+
 class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
     """
     MoE communication strategy using All-Gather + Reduce-Scatter on EP group.

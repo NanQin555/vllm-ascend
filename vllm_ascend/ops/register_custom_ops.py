@@ -12,7 +12,8 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_forward_context import MoECommType
-from vllm_ascend.ops.shmem_runtime import maybe_shmem_matmul_allreduce
+from vllm_ascend.ops.shmem_runtime import (maybe_shmem_matmul_allreduce,
+                                           shmem_dispatch_ffn_combine)
 from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
 from vllm_ascend.utils import npu_stream_switch, prefetch_stream
 from typing import Optional, Tuple
@@ -254,7 +255,8 @@ def _maybe_all_reduce_tensor_model_parallel_impl(
     forward_context = get_forward_context()
     moe_comm_type = forward_context.moe_comm_type
     if moe_comm_type in {
-            MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2
+            MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2,
+            MoECommType.SHMEM
     } or forward_context.sp_enabled:
         return final_hidden_states
     else:
@@ -310,6 +312,28 @@ def _shmem_matmul_allreduce_impl_fake(input_parallel: torch.Tensor,
     return torch.empty(size=output_shape,
                        device=input_parallel.device,
                        dtype=input_parallel.dtype)
+
+
+def _shmem_dispatch_ffn_combine_impl(
+    hidden_states: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    return shmem_dispatch_ffn_combine(
+        hidden_states, w13, w2, topk_weights, topk_ids)
+
+
+def _shmem_dispatch_ffn_combine_impl_fake(
+    hidden_states: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    del w13, w2, topk_weights, topk_ids
+    return torch.empty_like(hidden_states)
 
 
 # TODO(Angazenn): The reason why we use a custom op to encapsulate npu_quantize
@@ -403,6 +427,12 @@ direct_register_custom_op(op_name="matmul_and_reduce",
 direct_register_custom_op(op_name="shmem_matmul_allreduce",
                           op_func=_shmem_matmul_allreduce_impl,
                           fake_impl=_shmem_matmul_allreduce_impl_fake,
+                          mutates_args=[],
+                          dispatch_key="PrivateUse1")
+
+direct_register_custom_op(op_name="shmem_dispatch_ffn_combine",
+                          op_func=_shmem_dispatch_ffn_combine_impl,
+                          fake_impl=_shmem_dispatch_ffn_combine_impl_fake,
                           mutates_args=[],
                           dispatch_key="PrivateUse1")
 

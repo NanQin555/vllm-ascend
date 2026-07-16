@@ -191,6 +191,8 @@ class _ShmemRuntime:
         self._operators: dict[int, object] = {}
         self._kernel_entries: dict[tuple[int, str], Any] = {}
         self._output_buffers: dict[tuple[torch.dtype, str], _SymmetricOutputBuffer] = {}
+        self._moe_workspaces: dict[tuple[str, int, int, int, int, int],
+                                   torch.Tensor] = {}
 
     def ensure_initialized(self) -> Optional[str]:
         with self._lock:
@@ -269,6 +271,59 @@ class _ShmemRuntime:
         del layer
         return self._get_symmetric_output(shape, dtype, device)
 
+    def get_moe_workspace(
+        self,
+        device: torch.device,
+        m: int,
+        hidden_size: int,
+        gate_up_size: int,
+        top_k: int,
+        expert_per_rank: int,
+        required_bytes: int,
+    ) -> torch.Tensor:
+        with self._lock:
+            device_id = device.index
+            if device_id is None:
+                device_id = torch.npu.current_device()
+            normalized_device = torch.device(f"npu:{device_id}")
+            key = (
+                str(normalized_device),
+                m,
+                hidden_size,
+                gate_up_size,
+                top_k,
+                expert_per_rank,
+            )
+            workspace = self._moe_workspaces.get(key)
+            if workspace is None:
+                if _is_graph_capturing():
+                    raise RuntimeError(
+                        "SHMEM MoE workspace was not allocated before graph "
+                        "capture; run an eager warmup for every captured token "
+                        "shape")
+                workspace = torch.empty(
+                    required_bytes,
+                    dtype=torch.uint8,
+                    device=normalized_device,
+                )
+                self._moe_workspaces[key] = workspace
+                logger.info(
+                    "Allocated SHMEM MoE workspace: device=%s shape=(%s,%s,%s) "
+                    "top_k=%s local_experts=%s bytes=%s",
+                    normalized_device,
+                    m,
+                    hidden_size,
+                    gate_up_size,
+                    top_k,
+                    expert_per_rank,
+                    required_bytes,
+                )
+            elif workspace.numel() < required_bytes:
+                raise RuntimeError(
+                    "cached SHMEM MoE workspace is smaller than the kernel "
+                    f"request: cached={workspace.numel()} required={required_bytes}")
+            return workspace
+
     def prepare_symmetric_output(
         self,
         shape: tuple[int, int],
@@ -344,6 +399,7 @@ class _ShmemRuntime:
                 self._operators.clear()
                 self._kernel_entries.clear()
                 self._output_buffers.clear()
+                self._moe_workspaces.clear()
 
 
 _RUNTIME = _ShmemRuntime()
@@ -427,3 +483,115 @@ def maybe_shmem_matmul_allreduce(
             "and does not support fused bias"
         )
     return output_2d.reshape(*input_parallel.shape[:-1], weight_t.shape[1])
+
+
+def shmem_dispatch_ffn_combine(
+    hidden_states: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Run the experimental BF16 catccos/SHMEM EP MoE kernel.
+
+    The device kernel consumes row-major weights laid out as
+    ``[local_experts, K, 2 * intermediate]`` and
+    ``[local_experts, intermediate, K]``. Communication is performed over the
+    already initialized SHMEM world, which must match the vLLM EP group.
+    """
+    tensors = {
+        "hidden_states": hidden_states,
+        "w13": w13,
+        "w2": w2,
+    }
+    for name, tensor in tensors.items():
+        if tensor.dtype != torch.bfloat16:
+            raise RuntimeError(
+                f"SHMEM MoE only supports BF16, but {name} has {tensor.dtype}")
+        if not tensor.is_contiguous():
+            raise RuntimeError(
+                f"SHMEM MoE requires contiguous row-major {name}; got "
+                f"shape={tuple(tensor.shape)} stride={tuple(tensor.stride())}")
+
+    if hidden_states.ndim < 2:
+        raise RuntimeError("SHMEM MoE hidden_states must have rank >= 2")
+    hidden_2d = hidden_states.reshape(-1, hidden_states.shape[-1])
+    if w13.ndim != 3 or w2.ndim != 3:
+        raise RuntimeError(
+            "SHMEM MoE weights must be rank-3 [local_experts, K, N]")
+
+    m, hidden_size = hidden_2d.shape
+    expert_per_rank, w13_k, gate_up_size = w13.shape
+    w2_experts, intermediate_size, w2_n = w2.shape
+    if w13_k != hidden_size or w2_experts != expert_per_rank or \
+            intermediate_size * 2 != gate_up_size or w2_n != hidden_size:
+        raise RuntimeError(
+            "SHMEM MoE weight shape mismatch: "
+            f"hidden={tuple(hidden_2d.shape)} w13={tuple(w13.shape)} "
+            f"w2={tuple(w2.shape)}")
+
+    if topk_ids.ndim != 2 or topk_weights.ndim != 2 or \
+            topk_ids.shape != topk_weights.shape or topk_ids.shape[0] != m:
+        raise RuntimeError(
+            "SHMEM MoE expects matching [M, top_k] ids and weights: "
+            f"ids={tuple(topk_ids.shape)} weights={tuple(topk_weights.shape)} "
+            f"M={m}")
+    if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
+        raise RuntimeError("SHMEM MoE expert ids must be contiguous int32")
+    if topk_weights.dtype != torch.float32 or not topk_weights.is_contiguous():
+        raise RuntimeError("SHMEM MoE top-k weights must be contiguous float32")
+
+    init_reason = _RUNTIME.ensure_initialized()
+    if init_reason is not None:
+        raise RuntimeError(f"SHMEM MoE runtime initialization failed: {init_reason}")
+
+    block_dims = _get_block_dims()
+    workspace_size_entry = _RUNTIME.get_kernel_entry(
+        block_dims, "shmem_moe_workspace_size_bf16")
+    kernel_entry = _RUNTIME.get_kernel_entry(
+        block_dims, "shmem_dispatch_ffn_combine_bf16")
+    if workspace_size_entry is None or kernel_entry is None:
+        raise RuntimeError(
+            "installed shmem_operators module does not contain the MoE "
+            "DispatchFFNCombine entry points")
+
+    top_k = int(topk_ids.shape[1])
+    # Reuse one workspace for a power-of-two token bucket. Exact-M caching
+    # would retain a very large buffer for every prefill length seen by the
+    # engine and quickly exhaust NPU memory.
+    workspace_m = 1 << (int(m) - 1).bit_length()
+    required_bytes = int(
+        workspace_size_entry(
+            workspace_m,
+            hidden_size,
+            gate_up_size,
+            top_k,
+            expert_per_rank,
+        ))
+    workspace = _RUNTIME.get_moe_workspace(
+        hidden_2d.device,
+        workspace_m,
+        hidden_size,
+        gate_up_size,
+        top_k,
+        expert_per_rank,
+        required_bytes,
+    )
+    output = torch.empty_like(hidden_2d)
+    kernel_entry(
+        hidden_2d.data_ptr(),
+        w13.data_ptr(),
+        w2.data_ptr(),
+        topk_ids.data_ptr(),
+        topk_weights.data_ptr(),
+        output.data_ptr(),
+        workspace.data_ptr(),
+        required_bytes,
+        m,
+        hidden_size,
+        gate_up_size,
+        top_k,
+        expert_per_rank,
+        _current_stream_handle(),
+    )
+    return output.reshape(*hidden_states.shape[:-1], hidden_size)

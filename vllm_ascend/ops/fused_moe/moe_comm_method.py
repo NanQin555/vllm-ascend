@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Dict, Optional
 
 import torch
+import torch.distributed as dist
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
@@ -28,7 +29,8 @@ from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.ops.fused_moe.moe_mlp import unified_apply_mlp
 from vllm_ascend.ops.fused_moe.prepare_finalize import (
     PrepareAndFinalize, PrepareAndFinalizeWithAll2All,
-    PrepareAndFinalizeWithAllGather, PrepareAndFinalizeWithMC2, QuantType)
+    PrepareAndFinalizeWithAllGather, PrepareAndFinalizeWithMC2,
+    PrepareAndFinalizeWithShmem, QuantType)
 from vllm_ascend.ops.fused_moe.token_dispatcher import (
     MoETokenDispatcher, TokenDispatcherWithAll2AllV,
     TokenDispatcherWithAllGather, TokenDispatcherWithMC2)
@@ -46,6 +48,8 @@ def setup_moe_comm_method(moe_config):
     _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
     _MoECommMethods[MoECommType.MC2] = MC2CommImpl(moe_config)
     _MoECommMethods[MoECommType.FUSED_MC2] = FusedMC2CommImpl(moe_config)
+    if envs_ascend.VLLM_ASCEND_ENABLE_SHMEM_MOE:
+        _MoECommMethods[MoECommType.SHMEM] = ShmemCommImpl(moe_config)
 
 
 def set_gmmswigluquant_method():
@@ -257,6 +261,104 @@ class AlltoAllCommImpl(MoECommMethod):
 
     def _get_prepare_finalize(self):
         return PrepareAndFinalizeWithAll2All(self.moe_config)
+
+
+class ShmemCommImpl(MoECommMethod):
+    """Experimental Atlas A2 BF16 catccos/SHMEM MoE implementation.
+
+    The device kernel owns dispatch, both expert GEMMs, SwiGLU, the reverse
+    AllToAllV and final top-k combine. The regular token dispatcher is created
+    only to retain the same EP group initialization as the AllToAll path; its
+    dispatch/combine methods are intentionally bypassed.
+    """
+
+    def _get_token_dispatcher(self):
+        return TokenDispatcherWithAll2AllV(
+            top_k=self.moe_config.experts_per_token,
+            num_experts=self.moe_config.num_experts,
+            num_local_experts=self.moe_config.num_local_experts)
+
+    def _get_prepare_finalize(self):
+        return PrepareAndFinalizeWithShmem(self.moe_config)
+
+    def fused_experts(
+            self,
+            hidden_states: torch.Tensor,
+            w1: torch.Tensor | list[torch.Tensor],
+            w2: torch.Tensor | list[torch.Tensor],
+            topk_weights: torch.Tensor,
+            topk_ids: torch.Tensor,
+            activation: str = "silu",
+            apply_router_weight_on_input: bool = False,
+            use_int8_w8a8: bool = False,
+            use_int4_w4a8: bool = False,
+            use_int4_w4a16: bool = False,
+            expert_map: Optional[torch.Tensor] = None,
+            w1_scale: Optional[list[torch.Tensor]] = None,
+            w2_scale: Optional[list[torch.Tensor]] = None,
+            w1_scale_bias: torch.Tensor = None,
+            w2_scale_bias: torch.Tensor = None,
+            w1_offset: Optional[torch.Tensor] = None,
+            w2_offset: Optional[torch.Tensor] = None,
+            log2phy: torch.Tensor = None,
+            need_trans: bool = False,
+            dynamic_eplb: bool = False,
+            mc2_mask: torch.Tensor = None,
+            pertoken_scale: Optional[torch.Tensor] = None):
+        del (expert_map, w1_scale, w2_scale, w1_scale_bias, w2_scale_bias,
+             w1_offset, w2_offset, need_trans, mc2_mask, pertoken_scale)
+        if activation != "silu":
+            raise RuntimeError(
+                f"SHMEM MoE only supports SwiGLU/SILU, got {activation}")
+        if apply_router_weight_on_input:
+            raise RuntimeError(
+                "SHMEM MoE applies router weights during final combine and "
+                "does not support weighting dispatch inputs")
+        if use_int8_w8a8 or use_int4_w4a8 or use_int4_w4a16:
+            raise RuntimeError("SHMEM MoE does not support quantized experts")
+        if dynamic_eplb:
+            raise RuntimeError("SHMEM MoE does not support dynamic EPLB")
+        if isinstance(w1, list) or isinstance(w2, list):
+            raise RuntimeError("SHMEM MoE requires dense BF16 expert tensors")
+        if hidden_states.dtype != torch.bfloat16 or \
+                w1.dtype != torch.bfloat16 or w2.dtype != torch.bfloat16:
+            raise RuntimeError("SHMEM MoE requires BF16 activations and weights")
+        if envs_ascend.VLLM_ASCEND_ENABLE_NZ == 2:
+            raise RuntimeError(
+                "SHMEM MoE requires row-major expert weights; set "
+                "VLLM_ASCEND_ENABLE_NZ=0 or 1")
+
+        ep_size = self.moe_config.ep_group.world_size
+        if not dist.is_initialized() or dist.get_world_size() != ep_size:
+            raise RuntimeError(
+                "SHMEM MoE currently requires the SHMEM world to equal the "
+                f"EP group: global_world={dist.get_world_size() if dist.is_initialized() else 0} "
+                f"ep_world={ep_size}")
+        if self.moe_config.dp_size != 1 or \
+                self.moe_config.tp_group.world_size != ep_size:
+            raise RuntimeError(
+                "SHMEM MoE currently requires DP=1 and TP group equal to the "
+                f"EP group: dp={self.moe_config.dp_size} "
+                f"tp={self.moe_config.tp_group.world_size} ep={ep_size}")
+        if self.moe_config.num_experts != \
+                self.moe_config.num_local_experts * ep_size:
+            raise RuntimeError(
+                "SHMEM MoE requires a non-redundant contiguous expert "
+                "partition across EP ranks")
+
+        if log2phy is not None:
+            topk_ids = log2phy[topk_ids]
+        topk_ids = topk_ids.to(dtype=torch.int32).contiguous()
+        topk_weights = topk_weights.to(dtype=torch.float32).contiguous()
+
+        routed_out = torch.ops.vllm.shmem_dispatch_ffn_combine(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+        )
+        return FusedExpertsResult(routed_out=routed_out)
 
 
 class FusedMC2CommImpl(MoECommMethod):

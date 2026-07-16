@@ -114,6 +114,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # `dispatch_gmm_combine_decode` can be used only for **decode node** moe layer
     # with W8A8. And MTP layer must be W8A8.
     "VLLM_ASCEND_ENABLE_FUSED_MC2": lambda: int(os.getenv("VLLM_ASCEND_ENABLE_FUSED_MC2", "0")),
+    # Experimental BF16 Atlas A2 MoE Dispatch + FFN + Combine kernel backed
+    # by Ascend SHMEM and vendored catccos components.
+    "VLLM_ASCEND_ENABLE_SHMEM_MOE": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_SHMEM_MOE", "0"))),
     # Whether to anbale balance scheduling
     "VLLM_ASCEND_BALANCE_SCHEDULING": lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", "0"))),
 }

@@ -147,8 +147,10 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             expert_map=expert_map,
+            activation=kwargs.get("activation", "silu"),
             apply_router_weight_on_input=apply_router_weight_on_input,
             dynamic_eplb=self.dynamic_eplb,
+            log2phy=kwargs.get("log2phy", None),
             mc2_mask=kwargs.get("mc2_mask", None))
         if zero_expert_num > 0 and zero_expert_type is not None:
             final_hidden_states += zero_expert_result
@@ -306,7 +308,7 @@ class AscendFusedMoE(FusedMoE):
                 shared_out = fc3_context.shared_experts(hidden_states)
                 # NOTE: This is exactly the opposite of `maybe_all_reduce_tensor_model_parallel`
                 moe_comm_type = forward_context.moe_comm_type
-                if moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2} \
+                if moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2, MoECommType.SHMEM} \
                         and not shared_expert_dp_enabled():
                     shared_out = tensor_model_parallel_all_reduce(shared_out)
                 set_flash_common3_context(shared_out=shared_out)
@@ -543,7 +545,7 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         # `maybe_all_reduce_tensor_model_parallel`
         forward_context = get_forward_context()
         moe_comm_type = forward_context.moe_comm_type
-        if moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2} \
+        if moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2, MoECommType.SHMEM} \
                 and not shared_expert_dp_enabled():
             shared_out = tensor_model_parallel_all_reduce(shared_out)
         return shared_out

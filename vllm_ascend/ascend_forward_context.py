@@ -27,6 +27,7 @@ class MoECommType(Enum):
     MC2 = 1
     ALLTOALL = 2
     FUSED_MC2 = 3
+    SHMEM = 4
 
 
 @contextmanager
@@ -234,8 +235,21 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
         getattr(vllm_config.model_config.hf_text_config, "quantize", None),
     )
 
+    shmem_moe_enabled = envs_ascend.VLLM_ASCEND_ENABLE_SHMEM_MOE
     if not vllm_config.parallel_config.enable_expert_parallel or get_ep_group().world_size == 1:
         moe_comm_type = MoECommType.ALLGATHER
+    elif shmem_moe_enabled:
+        if soc_version != AscendDeviceType.A2:
+            raise ValueError(
+                "VLLM_ASCEND_ENABLE_SHMEM_MOE currently supports Atlas A2 only")
+        if quant_type is not None:
+            raise ValueError(
+                "VLLM_ASCEND_ENABLE_SHMEM_MOE currently supports unquantized "
+                f"BF16 MoE only, got quantization={quant_type}")
+        if get_ascend_config().eplb_config.dynamic_eplb:
+            raise ValueError(
+                "VLLM_ASCEND_ENABLE_SHMEM_MOE does not support dynamic EPLB")
+        moe_comm_type = MoECommType.SHMEM
     elif soc_version in {AscendDeviceType.A2}:
         if (
             num_tokens <= mc2_tokens_capacity
