@@ -21,6 +21,19 @@ _KERNEL_NAME_BY_DTYPE = {
     torch.bfloat16: "shmem_matmul_allreduce_overlap_bf16",
 }
 
+_SHMEM_DEBUG_HOST_CALLS = os.getenv(
+    "VLLM_ASCEND_SHMEM_DEBUG_HOST_CALLS", "0"
+).lower() in ("1", "true", "yes", "on")
+_SHMEM_DEBUG_LOCK = threading.Lock()
+_SHMEM_HOST_TOTAL_CALLS = 0
+_SHMEM_HOST_PRE_CAPTURE_CALLS = 0
+_SHMEM_HOST_CAPTURE_CALLS = 0
+_SHMEM_HOST_POST_CAPTURE_CALLS = 0
+_SHMEM_CAPTURE_SEEN = False
+_SHMEM_LOGGED_INPUT_LAYOUTS: set[
+    tuple[str, tuple[int, ...], tuple[int, ...], bool]
+] = set()
+
 
 def _strip_tcp_prefix(ip_port: str) -> str:
     if ip_port.startswith("tcp://"):
@@ -85,6 +98,104 @@ def _is_graph_capturing() -> bool:
     if not is_forward_context_available():
         return False
     return bool(getattr(get_forward_context(), "capturing", False))
+
+
+def _shmem_layer_kind(prefix: str) -> str:
+    if "o_proj" in prefix:
+        return "o_proj"
+    if "down_proj" in prefix:
+        return "down_proj"
+    return "other"
+
+
+def _record_shmem_host_call(
+    layer: torch.nn.Module,
+    input_parallel: torch.Tensor,
+) -> None:
+    if not _SHMEM_DEBUG_HOST_CALLS:
+        return
+
+    global _SHMEM_HOST_TOTAL_CALLS
+    global _SHMEM_HOST_PRE_CAPTURE_CALLS
+    global _SHMEM_HOST_CAPTURE_CALLS
+    global _SHMEM_HOST_POST_CAPTURE_CALLS
+    global _SHMEM_CAPTURE_SEEN
+
+    capturing = _is_graph_capturing()
+    prefix = str(getattr(layer, "prefix", "<unknown>"))
+    layer_kind = _shmem_layer_kind(prefix)
+    shape = tuple(int(dim) for dim in input_parallel.shape)
+    stride = tuple(int(dim) for dim in input_parallel.stride())
+    contiguous = input_parallel.is_contiguous()
+    layout_key = (layer_kind, shape, stride, contiguous)
+
+    emit_layout = False
+    emit_post_capture = False
+    total_calls = 0
+    post_capture_calls = 0
+
+    with _SHMEM_DEBUG_LOCK:
+        _SHMEM_HOST_TOTAL_CALLS += 1
+        total_calls = _SHMEM_HOST_TOTAL_CALLS
+
+        if capturing:
+            _SHMEM_CAPTURE_SEEN = True
+            _SHMEM_HOST_CAPTURE_CALLS += 1
+        elif _SHMEM_CAPTURE_SEEN:
+            _SHMEM_HOST_POST_CAPTURE_CALLS += 1
+            post_capture_calls = _SHMEM_HOST_POST_CAPTURE_CALLS
+            emit_post_capture = (
+                post_capture_calls <= 4 or post_capture_calls % 128 == 0
+            )
+        else:
+            _SHMEM_HOST_PRE_CAPTURE_CALLS += 1
+
+        if layout_key not in _SHMEM_LOGGED_INPUT_LAYOUTS:
+            _SHMEM_LOGGED_INPUT_LAYOUTS.add(layout_key)
+            emit_layout = True
+
+    if emit_layout:
+        logger.warning(
+            "[shmem-runtime-layout] pid=%s kind=%s prefix=%s "
+            "shape=%s stride=%s contiguous=%s capturing=%s",
+            os.getpid(),
+            layer_kind,
+            prefix,
+            shape,
+            stride,
+            contiguous,
+            capturing,
+        )
+
+    if emit_post_capture:
+        logger.error(
+            "[shmem-runtime-post-capture-call] pid=%s total=%s "
+            "post_capture=%s kind=%s prefix=%s shape=%s capturing=%s",
+            os.getpid(),
+            total_calls,
+            post_capture_calls,
+            layer_kind,
+            prefix,
+            shape,
+            capturing,
+        )
+
+
+def _dump_shmem_host_call_stats() -> None:
+    if not _SHMEM_DEBUG_HOST_CALLS:
+        return
+
+    with _SHMEM_DEBUG_LOCK:
+        logger.warning(
+            "[shmem-runtime-summary] pid=%s total=%s pre_capture=%s "
+            "capture=%s post_capture=%s capture_seen=%s",
+            os.getpid(),
+            _SHMEM_HOST_TOTAL_CALLS,
+            _SHMEM_HOST_PRE_CAPTURE_CALLS,
+            _SHMEM_HOST_CAPTURE_CALLS,
+            _SHMEM_HOST_POST_CAPTURE_CALLS,
+            _SHMEM_CAPTURE_SEEN,
+        )
 
 
 def _build_weight_for_shmem(layer: torch.nn.Module) -> torch.Tensor:
@@ -348,6 +459,7 @@ class _ShmemRuntime:
 
 _RUNTIME = _ShmemRuntime()
 atexit.register(_RUNTIME.destroy)
+atexit.register(_dump_shmem_host_call_stats)
 
 
 def finalize_shmem_matmul_allreduce(layer: torch.nn.Module) -> None:
@@ -377,6 +489,9 @@ def maybe_shmem_matmul_allreduce(
     input_parallel: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
+    if _SHMEM_DEBUG_HOST_CALLS:
+        _record_shmem_host_call(layer, input_parallel)
+
     static_reason = getattr(layer, "_shmem_static_reason", None)
     if static_reason is not None:
         raise RuntimeError(f"shmem matmul-allreduce disabled: {static_reason}")
