@@ -607,7 +607,10 @@ class NPUPlatform(Platform):
             sp_enabled = enable_sp(vllm_config) and num_tokens is not None
             mmrs_fusion = False
         else:
-            sp_enabled = enable_sp(vllm_config) and num_tokens is not None and num_tokens > 1000
+            sp_token_threshold = int(
+                os.getenv("VLLM_ASCEND_SP_TOKEN_THRESHOLD", "1000"))
+            sp_enabled = (enable_sp(vllm_config) and num_tokens is not None
+                          and num_tokens > sp_token_threshold)
 
         # TODO(Levi-JQ): another PR to normalize the enabling logic for sp/fc2
         flashcomm_v2_enabled = flashcomm2_enable() and tp_world_size > 1 and num_tokens is not None

@@ -541,6 +541,16 @@ def maybe_shmem_matmul_reduce_scatter(
         input_2d.shape[1],
         stream_handle,
     )
+    logger.info_once(
+        "Using shmem matmul-reduce-scatter kernel: prefix=%s rows=%s "
+        "local_rows=%s n=%s k=%s world_size=%s",
+        getattr(layer, "prefix", "<unknown>"),
+        input_2d.shape[0],
+        input_2d.shape[0] // world_size,
+        weight_t.shape[1],
+        input_2d.shape[1],
+        world_size,
+    )
     if bias is not None:
         output_2d.add_(bias)
 

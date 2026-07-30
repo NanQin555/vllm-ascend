@@ -1,4 +1,5 @@
 import math
+import os
 from contextlib import contextmanager
 from enum import Enum
 from typing import Any
@@ -92,7 +93,10 @@ def set_ascend_forward_context(
             # Disable it to avoid more problems.
             sp_enabled = False
         else:
-            sp_enabled = enable_sp(vllm_config) and num_tokens is not None and num_tokens > 1000
+            sp_token_threshold = int(
+                os.getenv("VLLM_ASCEND_SP_TOKEN_THRESHOLD", "1000"))
+            sp_enabled = (enable_sp(vllm_config) and num_tokens is not None
+                          and num_tokens > sp_token_threshold)
 
         forward_context.mmrs_fusion = mmrs_fusion
         forward_context.num_tokens = num_tokens

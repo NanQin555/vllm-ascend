@@ -37,6 +37,7 @@ How to extend a new linear op? Taking column parallel op as an example:
 Row parallel op follows a similar approach - inherit from RowColumnParallelOp and register the new class in get_row_parallel_op.
 """
 
+import os
 import re
 from functools import lru_cache
 from types import SimpleNamespace
@@ -54,6 +55,7 @@ from vllm.distributed import (split_tensor_along_last_dim,
                               tensor_model_parallel_reduce_scatter)
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 
 from vllm_ascend import envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
@@ -67,6 +69,8 @@ from vllm_ascend.utils import (enable_dsa_cp, enable_dsa_cp_with_layer_shard, en
                                get_flashcomm2_reorgnized_batch_ids,
                                matmul_allreduce_enable, mlp_tp_enable,
                                oproj_tp_enable, shared_expert_dp_enabled)
+
+logger = init_logger(__name__)
 
 
 class CustomLinearOp:
@@ -594,12 +598,21 @@ class SequenceRowParallelOp(CustomRowParallelOp):
         # For unquant
         if mmrs_fusion and isinstance(self.layer.quant_method,
                                       UnquantizedLinearMethod):
+            strict_shmem_mmrs = os.getenv(
+                "VLLM_ASCEND_SHMEM_MMRS_STRICT",
+                "0").lower() in {"1", "true", "yes", "on"}
             if getattr(self.layer, "_can_try_shmem_matmul_reduce_scatter",
                        False):
                 try:
                     output = maybe_shmem_matmul_reduce_scatter(
                         self.layer, x, bias=None)
-                except RuntimeError:
+                except RuntimeError as exc:
+                    if strict_shmem_mmrs:
+                        raise
+                    logger.warning_once(
+                        "shmem matmul-reduce-scatter fallback to "
+                        "torch_npu.npu_mm_reduce_scatter_base for %s: %s",
+                        self.layer.prefix, exc)
                     output = torch_npu.npu_mm_reduce_scatter_base(
                         x,
                         self.layer.weight.t(),
@@ -610,6 +623,11 @@ class SequenceRowParallelOp(CustomRowParallelOp):
                         comm_turn=0,
                         comm_mode=comm_mode)
             else:
+                if strict_shmem_mmrs:
+                    raise RuntimeError(
+                        "VLLM_ASCEND_SHMEM_MMRS_STRICT is enabled but this "
+                        "layer was not prepared for shmem matmul-reduce-scatter: "
+                        f"prefix={self.layer.prefix}")
                 output = torch_npu.npu_mm_reduce_scatter_base(
                     x,
                     self.layer.weight.t(),
