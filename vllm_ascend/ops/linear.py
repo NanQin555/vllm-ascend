@@ -39,12 +39,19 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.distributed import tensor_model_parallel_all_reduce
 
 from vllm_ascend.ops.linear_op import get_parallel_op, get_replicated_op
-from vllm_ascend.ops.shmem_runtime import (finalize_shmem_matmul_allreduce,
-                                           prepare_shmem_matmul_allreduce)
+from vllm_ascend.ops.shmem_runtime import (
+    finalize_shmem_matmul_allreduce, finalize_shmem_matmul_reduce_scatter,
+    prepare_shmem_matmul_allreduce, prepare_shmem_matmul_reduce_scatter)
 from vllm_ascend.utils import enable_sp, maybe_trans_nz
 
 _SHMEM_ENABLED = (
     os.getenv("VLLM_ASCEND_ENABLE_SHMEM_MATMUL_ALLREDUCE")
+    or os.getenv("VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE", "0")
+).lower() in {"1", "true", "yes", "on"}
+_SHMEM_MMRS_ENABLED = (
+    os.getenv("VLLM_ASCEND_ENABLE_SHMEM_MATMUL_REDUCE_SCATTER")
+    or os.getenv("VLLM_ASCEND_ENABLE_SHMEM_MMRS")
+    or os.getenv("VLLM_ASCEND_ENABLE_SHMEM_MATMUL_ALLREDUCE")
     or os.getenv("VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE", "0")
 ).lower() in {"1", "true", "yes", "on"}
 
@@ -85,6 +92,7 @@ class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
         if "conv1d" not in layer.prefix:
             layer.weight.data = maybe_trans_nz(layer.weight.data)
         finalize_shmem_matmul_allreduce(layer)
+        finalize_shmem_matmul_reduce_scatter(layer)
 
 
 # TODO(realliujiaxu): Remove this class after linear of vllm supports custom comm group
@@ -278,7 +286,7 @@ class AscendRowParallelLinear(RowParallelLinear):
     ):
         # TODO(kunpengW-code): Specifying the prefix in linear layers of some models in the vLLM.
         self.unique_prefix = prefix
-        if enable_sp() or _SHMEM_ENABLED:
+        if enable_sp() or _SHMEM_ENABLED or _SHMEM_MMRS_ENABLED:
             compilation_config = get_current_vllm_config().compilation_config
             if prefix in compilation_config.static_forward_context:
                 self.unique_prefix = (
@@ -341,8 +349,18 @@ class AscendRowParallelLinear(RowParallelLinear):
             and any(token in prefix for token in ("o_proj", "down_proj"))
             and "UnquantizedLinearMethod" in type(self.quant_method).__name__
         )
+        self._can_try_shmem_matmul_reduce_scatter = (
+            _SHMEM_MMRS_ENABLED
+            and reduce_results
+            and self.tp_size > 1
+            and any(token in prefix for token in (
+                "o_proj", "out_proj", "down_proj", "attention.dense"))
+            and "UnquantizedLinearMethod" in type(self.quant_method).__name__
+        )
         if self._can_try_shmem_matmul_allreduce:
             prepare_shmem_matmul_allreduce(self)
+        if self._can_try_shmem_matmul_reduce_scatter:
+            prepare_shmem_matmul_reduce_scatter(self)
         if self.custom_op is not None:
             self.custom_op.update_attrs()
 

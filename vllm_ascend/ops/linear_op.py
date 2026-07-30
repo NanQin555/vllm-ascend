@@ -62,6 +62,7 @@ from vllm_ascend.distributed.parallel_state import (get_flashcomm2_odp_group,
                                                     get_mlp_tp_group,
                                                     get_otp_group)
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
+from vllm_ascend.ops.shmem_runtime import maybe_shmem_matmul_reduce_scatter
 from vllm_ascend.utils import (enable_dsa_cp, enable_dsa_cp_with_layer_shard, enable_sp, flashcomm2_enable,
                                get_flashcomm2_reorgnized_batch_ids,
                                matmul_allreduce_enable, mlp_tp_enable,
@@ -593,15 +594,31 @@ class SequenceRowParallelOp(CustomRowParallelOp):
         # For unquant
         if mmrs_fusion and isinstance(self.layer.quant_method,
                                       UnquantizedLinearMethod):
-            output = torch_npu.npu_mm_reduce_scatter_base(
-                x,
-                self.layer.weight.t(),
-                hcom_name,
-                world_size,
-                reduce_op="sum",
-                bias=None,
-                comm_turn=0,
-                comm_mode=comm_mode)
+            if getattr(self.layer, "_can_try_shmem_matmul_reduce_scatter",
+                       False):
+                try:
+                    output = maybe_shmem_matmul_reduce_scatter(
+                        self.layer, x, bias=None)
+                except RuntimeError:
+                    output = torch_npu.npu_mm_reduce_scatter_base(
+                        x,
+                        self.layer.weight.t(),
+                        hcom_name,
+                        world_size,
+                        reduce_op="sum",
+                        bias=None,
+                        comm_turn=0,
+                        comm_mode=comm_mode)
+            else:
+                output = torch_npu.npu_mm_reduce_scatter_base(
+                    x,
+                    self.layer.weight.t(),
+                    hcom_name,
+                    world_size,
+                    reduce_op="sum",
+                    bias=None,
+                    comm_turn=0,
+                    comm_mode=comm_mode)
             if bias_ is not None:
                 output.add_(bias_)
         # For w8a8 quant
@@ -736,11 +753,6 @@ def _get_row_parallel_op(
         return MLPRowParallelOp(layer)
     if "o_proj" in prefix and oproj_tp_enable():
         return OProjRowParallelOp(layer)
-    if matmul_allreduce_enable():
-        return MatmulAllreduceRowParallelOp(layer)
-    if flashcomm2_enable():
-        if "o_proj" in prefix or "out_proj" in prefix:
-            return Flashcomm2OProjRowParallelOp(layer)
     if enable_sp():
         if "shared_expert" in prefix:
             return None
@@ -753,6 +765,11 @@ def _get_row_parallel_op(
         for a_prefix in sp_row_prefixes:
             if a_prefix in prefix:
                 return SequenceRowParallelOp(layer)
+    if matmul_allreduce_enable():
+        return MatmulAllreduceRowParallelOp(layer)
+    if flashcomm2_enable():
+        if "o_proj" in prefix or "out_proj" in prefix:
+            return Flashcomm2OProjRowParallelOp(layer)
 
     return None
 

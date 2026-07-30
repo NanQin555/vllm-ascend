@@ -72,6 +72,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Whether to enable MatmulAllReduce fusion kernel when tensor parallel is enabled.
     # this feature is supported in A2, and eager mode will get better performance.
     "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE", "0"))),
+    # Whether to enable the external shmem MatmulReduceScatter kernel on the
+    # sequence-parallel row-linear path. It defaults to the shmem allreduce
+    # switch so benchmark scripts can enable both fused collectives together.
+    "VLLM_ASCEND_ENABLE_SHMEM_MATMUL_REDUCE_SCATTER": lambda: bool(int(
+        os.getenv("VLLM_ASCEND_ENABLE_SHMEM_MATMUL_REDUCE_SCATTER",
+                  os.getenv("VLLM_ASCEND_ENABLE_SHMEM_MMRS",
+                            os.getenv("VLLM_ASCEND_ENABLE_SHMEM_MATMUL_ALLREDUCE",
+                                      os.getenv("VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE", "0")))))),
     # Whether to enable FlashComm optimization when tensor parallel is enabled.
     # This feature will get better performance when concurrency is large.
     "VLLM_ASCEND_ENABLE_FLASHCOMM1": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", "0"))),
