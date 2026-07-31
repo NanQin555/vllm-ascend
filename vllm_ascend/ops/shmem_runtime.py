@@ -23,6 +23,11 @@ _KERNEL_NAME_BY_DTYPE = {
 _MMRS_KERNEL_NAME_BY_DTYPE = {
     torch.bfloat16: "shmem_matmul_reduce_scatter_bf16",
 }
+_MMRS_ROWS_PER_RANK_ALIGNMENT = 128
+
+
+class ShmemMatmulReduceScatterUnsupportedShape(RuntimeError):
+    pass
 
 
 def _strip_tcp_prefix(ip_port: str) -> str:
@@ -524,11 +529,18 @@ def maybe_shmem_matmul_reduce_scatter(
             "shmem matmul-reduce-scatter requires input rows divisible by "
             f"world_size: rows={input_2d.shape[0]} world_size={world_size}"
         )
+    rows_per_rank = input_2d.shape[0] // world_size
+    if rows_per_rank % _MMRS_ROWS_PER_RANK_ALIGNMENT != 0:
+        raise ShmemMatmulReduceScatterUnsupportedShape(
+            "shmem matmul-reduce-scatter overlap path requires rows_per_rank "
+            f"divisible by {_MMRS_ROWS_PER_RANK_ALIGNMENT}: "
+            f"rows={input_2d.shape[0]} world_size={world_size} "
+            f"rows_per_rank={rows_per_rank}")
 
     stream_handle = _current_stream_handle()
     output_2d = _RUNTIME.get_symmetric_output(
         layer,
-        (input_2d.shape[0] // world_size, weight_t.shape[1]),
+        (rows_per_rank, weight_t.shape[1]),
         input_2d.dtype,
         input_2d.device,
     )
@@ -546,7 +558,7 @@ def maybe_shmem_matmul_reduce_scatter(
         "local_rows=%s n=%s k=%s world_size=%s",
         getattr(layer, "prefix", "<unknown>"),
         input_2d.shape[0],
-        input_2d.shape[0] // world_size,
+        rows_per_rank,
         weight_t.shape[1],
         input_2d.shape[1],
         world_size,
@@ -555,8 +567,8 @@ def maybe_shmem_matmul_reduce_scatter(
         output_2d.add_(bias)
 
     output_shape = (*input_parallel.shape[:-2],
-                    input_2d.shape[0] // world_size,
+                    rows_per_rank,
                     weight_t.shape[1])
     if input_parallel.dim() == 2:
-        output_shape = (input_2d.shape[0] // world_size, weight_t.shape[1])
+        output_shape = (rows_per_rank, weight_t.shape[1])
     return output_2d.reshape(output_shape)

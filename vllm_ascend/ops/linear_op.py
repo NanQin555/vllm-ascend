@@ -64,7 +64,9 @@ from vllm_ascend.distributed.parallel_state import (get_flashcomm2_odp_group,
                                                     get_mlp_tp_group,
                                                     get_otp_group)
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
-from vllm_ascend.ops.shmem_runtime import maybe_shmem_matmul_reduce_scatter
+from vllm_ascend.ops.shmem_runtime import (
+    ShmemMatmulReduceScatterUnsupportedShape,
+    maybe_shmem_matmul_reduce_scatter)
 from vllm_ascend.utils import (enable_dsa_cp, enable_dsa_cp_with_layer_shard, enable_sp, flashcomm2_enable,
                                get_flashcomm2_reorgnized_batch_ids,
                                matmul_allreduce_enable, mlp_tp_enable,
@@ -606,6 +608,20 @@ class SequenceRowParallelOp(CustomRowParallelOp):
                 try:
                     output = maybe_shmem_matmul_reduce_scatter(
                         self.layer, x, bias=None)
+                except ShmemMatmulReduceScatterUnsupportedShape as exc:
+                    logger.warning_once(
+                        "shmem matmul-reduce-scatter shape fallback to "
+                        "torch_npu.npu_mm_reduce_scatter_base for %s: %s",
+                        self.layer.prefix, exc)
+                    output = torch_npu.npu_mm_reduce_scatter_base(
+                        x,
+                        self.layer.weight.t(),
+                        hcom_name,
+                        world_size,
+                        reduce_op="sum",
+                        bias=None,
+                        comm_turn=0,
+                        comm_mode=comm_mode)
                 except RuntimeError as exc:
                     if strict_shmem_mmrs:
                         raise
