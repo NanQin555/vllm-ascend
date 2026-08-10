@@ -291,15 +291,7 @@ def _shmem_matmul_allreduce_impl(input_parallel: torch.Tensor,
     forward_context = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
     bias_ = None if self.skip_bias_add else self.bias
-    output = maybe_shmem_matmul_allreduce(self, input_parallel, bias_)
-    if output is not None:
-        return output
-
-    assert self.quant_method is not None
-    output_parallel = self.quant_method.apply(self, input_parallel, bias_)
-    if self.reduce_results and self.tp_size > 1:
-        return tensor_model_parallel_all_reduce(output_parallel)
-    return output_parallel
+    return maybe_shmem_matmul_allreduce(self, input_parallel, bias_)
 
 
 def _shmem_matmul_allreduce_impl_fake(input_parallel: torch.Tensor,

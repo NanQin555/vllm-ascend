@@ -16,6 +16,7 @@ _DEFAULT_BLOCK_DIMS = 20
 _DEFAULT_LOCAL_MEM_SIZE = 1024 * 1024 * 1024
 _DEFAULT_IP_PORT = "tcp://127.0.0.1:8667"
 _OUTPUT_BUFFER_ALIGNMENT = 512
+_MAX_SUPPORTED_RANKS = 8
 _CACHED_BLOCK_DIMS: Optional[int] = None
 _KERNEL_NAME_BY_DTYPE = {
     torch.bfloat16: "shmem_matmul_allreduce_overlap_bf16",
@@ -302,10 +303,19 @@ class _ShmemRuntime:
         self._operators: dict[int, object] = {}
         self._kernel_entries: dict[tuple[int, str], Any] = {}
         self._output_buffers: dict[tuple[torch.dtype, str], _SymmetricOutputBuffer] = {}
+        self._rank: Optional[int] = None
+        self._world_size: Optional[int] = None
+        self._logged_operator_call = False
 
-    def ensure_initialized(self) -> Optional[str]:
+    def ensure_initialized(self, tp_rank: int, tp_size: int) -> Optional[str]:
         with self._lock:
             if self._initialized:
+                if self._rank != tp_rank or self._world_size != tp_size:
+                    return (
+                        "shmem_runtime_group_changed:"
+                        f"initialized={self._rank}/{self._world_size},"
+                        f"requested={tp_rank}/{tp_size}"
+                    )
                 return None
 
             try:
@@ -321,12 +331,23 @@ class _ShmemRuntime:
             if not dist.is_initialized():
                 return "torch_distributed_not_initialized"
 
+            global_rank = dist.get_rank()
+            global_world_size = dist.get_world_size()
+            if tp_size < 2 or tp_size > _MAX_SUPPORTED_RANKS:
+                return f"unsupported_tp_size:{tp_size}"
+            if global_rank != tp_rank or global_world_size != tp_size:
+                return (
+                    "only_global_tp_group_is_supported:"
+                    f"global={global_rank}/{global_world_size},"
+                    f"tp={tp_rank}/{tp_size}"
+                )
+
             ip_port = os.getenv("VLLM_ASCEND_SHMEM_IP_PORT", _DEFAULT_IP_PORT)
             os.environ.setdefault("SHMEM_UID_SESSION_ID", _strip_tcp_prefix(ip_port))
 
             attr = ash.InitAttr()
-            attr.my_rank = dist.get_rank()
-            attr.n_ranks = dist.get_world_size()
+            attr.my_rank = tp_rank
+            attr.n_ranks = tp_size
             attr.local_mem_size = int(
                 os.getenv(
                     "VLLM_ASCEND_SHMEM_LOCAL_MEM_SIZE",
@@ -347,6 +368,8 @@ class _ShmemRuntime:
             self._ash = ash
             self._tensor_from_ptr = tensor_from_ptr
             self._shmem_operators = shmem_operators
+            self._rank = tp_rank
+            self._world_size = tp_size
             self._initialized = True
             logger.info(
                 "Initialized shmem runtime for matmul-allreduce: rank=%s world_size=%s ip_port=%s",
@@ -355,6 +378,31 @@ class _ShmemRuntime:
                 ip_port,
             )
             return None
+
+    def log_operator_call_once(
+        self,
+        layer_name: str,
+        m: int,
+        n: int,
+        k: int,
+        dtype: torch.dtype,
+    ) -> None:
+        with self._lock:
+            if self._logged_operator_call or self._rank != 0:
+                return
+            self._logged_operator_call = True
+            world_size = self._world_size
+
+        logger.warning(
+            "[shmem-operator] called=1 rank=0/%s layer=%s "
+            "shape=(%s,%s,%s) dtype=%s",
+            world_size,
+            layer_name,
+            m,
+            n,
+            k,
+            dtype,
+        )
 
     def get_kernel_entry(self, block_dims: int, kernel_name: str):
         with self._lock:
@@ -452,9 +500,15 @@ class _ShmemRuntime:
                 logger.exception("Failed to shutdown shmem runtime cleanly")
             finally:
                 self._initialized = False
+                self._ash = None
+                self._tensor_from_ptr = None
+                self._shmem_operators = None
                 self._operators.clear()
                 self._kernel_entries.clear()
                 self._output_buffers.clear()
+                self._rank = None
+                self._world_size = None
+                self._logged_operator_call = False
 
 
 _RUNTIME = _ShmemRuntime()
@@ -466,17 +520,30 @@ def finalize_shmem_matmul_allreduce(layer: torch.nn.Module) -> None:
     if not getattr(layer, "_can_try_shmem_matmul_allreduce", False):
         return
 
-    if getattr(layer, "_shmem_static_reason", None) is not None:
-        return
+    static_reason = getattr(layer, "_shmem_static_reason", None)
+    if static_reason is not None:
+        raise RuntimeError(
+            f"shmem matmul-allreduce cannot initialize {layer.prefix}: "
+            f"{static_reason}"
+        )
 
     weight_t = _build_weight_for_shmem(layer)
     if getattr(layer, "_shmem_kernel_entry", None) is not None:
         return
-    if _RUNTIME.ensure_initialized() is not None:
-        return
+    init_reason = _RUNTIME.ensure_initialized(layer.tp_rank, layer.tp_size)
+    if init_reason is not None:
+        raise RuntimeError(
+            f"shmem matmul-allreduce cannot initialize {layer.prefix}: "
+            f"{init_reason}"
+        )
     layer._shmem_kernel_entry = _RUNTIME.get_kernel_entry(
         layer._shmem_block_dims, layer._shmem_kernel_name
     )
+    if layer._shmem_kernel_entry is None:
+        raise RuntimeError(
+            "shmem_operators does not expose required kernel: "
+            f"{layer._shmem_kernel_name}"
+        )
     _RUNTIME.prepare_symmetric_output(
         (_get_prealloc_output_tokens(), int(weight_t.shape[1])),
         weight_t.dtype,
@@ -488,13 +555,18 @@ def maybe_shmem_matmul_allreduce(
     layer: torch.nn.Module,
     input_parallel: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor:
     if _SHMEM_DEBUG_HOST_CALLS:
         _record_shmem_host_call(layer, input_parallel)
 
     static_reason = getattr(layer, "_shmem_static_reason", None)
     if static_reason is not None:
         raise RuntimeError(f"shmem matmul-allreduce disabled: {static_reason}")
+    if bias is not None:
+        raise RuntimeError(
+            "shmem matmul-allreduce returns symmetric output directly and "
+            "does not support fused bias"
+        )
 
     weight_t = getattr(layer, "_shmem_matmul_allreduce_weight_t", None)
     if weight_t is None:
@@ -504,6 +576,13 @@ def maybe_shmem_matmul_allreduce(
             "shmem matmul-allreduce requires input and weight to use the "
             "same dtype: "
             f"input_dtype={input_parallel.dtype} weight_dtype={weight_t.dtype}"
+        )
+    if input_parallel.device != weight_t.device:
+        raise RuntimeError(
+            "shmem matmul-allreduce requires input and weight on the same "
+            "device: "
+            f"input_device={input_parallel.device} "
+            f"weight_device={weight_t.device}"
         )
     if input_parallel.shape[-1] != weight_t.shape[0]:
         raise RuntimeError(
@@ -536,9 +615,11 @@ def maybe_shmem_matmul_allreduce(
         input_2d.shape[1],
         stream_handle,
     )
-    if bias is not None:
-        raise RuntimeError(
-            "shmem matmul-allreduce overlap returns symmetric output directly "
-            "and does not support fused bias"
-        )
+    _RUNTIME.log_operator_call_once(
+        str(layer.prefix),
+        int(input_2d.shape[0]),
+        int(weight_t.shape[1]),
+        int(input_2d.shape[1]),
+        input_2d.dtype,
+    )
     return output_2d.reshape(*input_parallel.shape[:-1], weight_t.shape[1])

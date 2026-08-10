@@ -29,6 +29,7 @@ import torch.nn as nn
 from torch.nn.parameter import Parameter
 from vllm.config import get_current_vllm_config
 from vllm.distributed import divide
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.layers.linear import (  # noqa
     WEIGHT_LOADER_V2_SUPPORTED, ColumnParallelLinear, LinearBase,
     MergedColumnParallelLinear, QKVParallelLinear, QuantizeMethodBase,
@@ -43,10 +44,18 @@ from vllm_ascend.ops.shmem_runtime import (finalize_shmem_matmul_allreduce,
                                            prepare_shmem_matmul_allreduce)
 from vllm_ascend.utils import enable_sp, maybe_trans_nz
 
-_SHMEM_ENABLED = (
-    os.getenv("VLLM_ASCEND_ENABLE_SHMEM_MATMUL_ALLREDUCE")
-    or os.getenv("VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE", "0")
-).lower() in {"1", "true", "yes", "on"}
+def _env_enabled(name: str) -> bool:
+    return os.getenv(name, "0").lower() in {"1", "true", "yes", "on"}
+
+
+_SHMEM_ENABLED = _env_enabled(
+    "VLLM_ASCEND_ENABLE_SHMEM_MATMUL_ALLREDUCE")
+_NATIVE_MAR_ENABLED = _env_enabled("VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE")
+if _SHMEM_ENABLED and _NATIVE_MAR_ENABLED:
+    raise RuntimeError(
+        "VLLM_ASCEND_ENABLE_SHMEM_MATMUL_ALLREDUCE and "
+        "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE are mutually exclusive"
+    )
 
 
 def split_tensor_along_last_dim(
@@ -277,8 +286,14 @@ class AscendRowParallelLinear(RowParallelLinear):
         disable_tp: bool = False,
     ):
         # TODO(kunpengW-code): Specifying the prefix in linear layers of some models in the vLLM.
+        shmem_target = (
+            _SHMEM_ENABLED
+            and not disable_tp
+            and any(token in prefix for token in ("o_proj", "down_proj"))
+            and "shared_expert" not in prefix
+        )
         self.unique_prefix = prefix
-        if enable_sp() or _SHMEM_ENABLED:
+        if enable_sp() or shmem_target:
             compilation_config = get_current_vllm_config().compilation_config
             if prefix in compilation_config.static_forward_context:
                 self.unique_prefix = (
@@ -288,8 +303,14 @@ class AscendRowParallelLinear(RowParallelLinear):
                 AscendRowParallelLinear.unique_prefix_idx += 1
             compilation_config.static_forward_context[self.unique_prefix] = self
 
-        self.custom_op, self.tp_rank, self.tp_size = get_parallel_op(
-            disable_tp, prefix, self, "row")
+        if shmem_target:
+            tp_group = get_tp_group()
+            self.custom_op = None
+            self.tp_rank = tp_group.rank_in_group
+            self.tp_size = tp_group.world_size
+        else:
+            self.custom_op, self.tp_rank, self.tp_size = get_parallel_op(
+                disable_tp, prefix, self, "row")
         # TODO(realliujiaxu): Replace the initialization code below with super().__init__ after linear of vllm supports custom comm group
         # Divide the weight matrix along the first dimension.
         self.input_size_per_partition = divide(input_size, self.tp_size)
@@ -335,12 +356,21 @@ class AscendRowParallelLinear(RowParallelLinear):
             self.register_parameter("bias", None)
 
         self._can_try_shmem_matmul_allreduce = (
-            _SHMEM_ENABLED
+            shmem_target
             and reduce_results
-            and self.tp_size > 1
-            and any(token in prefix for token in ("o_proj", "down_proj"))
-            and "UnquantizedLinearMethod" in type(self.quant_method).__name__
+            and 1 < self.tp_size <= 8
+            and isinstance(self.quant_method, AscendUnquantizedLinearMethod)
+            and self.weight.dtype == torch.bfloat16
+            and self.bias is None
         )
+        if shmem_target and not self._can_try_shmem_matmul_allreduce:
+            raise RuntimeError(
+                "SHMEM MatmulAllReduce requires BF16 unquantized weights, "
+                "no bias, reduce_results=True, and TP size in [2, 8]: "
+                f"layer={prefix} tp_size={self.tp_size} "
+                f"reduce_results={reduce_results} bias={self.bias is not None} "
+                f"weight_dtype={self.weight.dtype}"
+            )
         if self._can_try_shmem_matmul_allreduce:
             prepare_shmem_matmul_allreduce(self)
         if self.custom_op is not None:
@@ -351,6 +381,21 @@ class AscendRowParallelLinear(RowParallelLinear):
         input_,
         **kwargs,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
+        if self._can_try_shmem_matmul_allreduce:
+            if self.input_is_parallel:
+                input_parallel = input_
+            else:
+                splitted_input = split_tensor_along_last_dim(
+                    input_, num_partitions=self.tp_size
+                )
+                input_parallel = splitted_input[self.tp_rank].contiguous()
+            output = torch.ops.vllm.shmem_matmul_allreduce(
+                input_parallel, self.unique_prefix
+            )
+            if not self.return_bias:
+                return output
+            return output, None
+
         if self.custom_op is not None:
             return self.custom_op.apply(input_)
 
@@ -363,18 +408,12 @@ class AscendRowParallelLinear(RowParallelLinear):
             input_parallel = splitted_input[self.tp_rank].contiguous()
 
         assert self.quant_method is not None
-
-        if self._can_try_shmem_matmul_allreduce:
-            output = torch.ops.vllm.shmem_matmul_allreduce(
-                input_parallel, self.unique_prefix
-            )
+        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        output_parallel = self.quant_method.apply(self, input_parallel, bias_)
+        if self.reduce_results and self.tp_size > 1:
+            output = tensor_model_parallel_all_reduce(output_parallel)
         else:
-            bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-            output_parallel = self.quant_method.apply(self, input_parallel, bias_)
-            if self.reduce_results and self.tp_size > 1:
-                output = tensor_model_parallel_all_reduce(output_parallel)
-            else:
-                output = output_parallel
+            output = output_parallel
 
         if not self.return_bias:
             return output
