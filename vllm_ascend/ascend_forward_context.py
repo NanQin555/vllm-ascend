@@ -87,7 +87,6 @@ def set_ascend_forward_context(
         is_context_moe_model = is_drafter_moe_model(vllm_config) if is_draft_model else is_moe_model(vllm_config)
         if is_context_moe_model:
             sp_enabled = enable_sp(vllm_config) and num_tokens is not None
-            mmrs_fusion = False
         elif is_draft_model:
             # TODO: for dense drafter, `sp` is redundant and is not compatible with `dp` and `graph`.
             # Disable it to avoid more problems.
@@ -99,6 +98,9 @@ def set_ascend_forward_context(
                           and num_tokens > sp_token_threshold)
 
         forward_context.mmrs_fusion = mmrs_fusion
+        # MoE models keep the global mmrs capability enabled here and let the
+        # row-parallel linear path narrow it to attention output layers only.
+        forward_context.is_context_moe_model = is_context_moe_model
         forward_context.num_tokens = num_tokens
         forward_context.sp_enabled = sp_enabled
         # TODO(Levi-JQ): another PR to normalize the enabling logic for sp/fc2

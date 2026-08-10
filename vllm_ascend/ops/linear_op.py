@@ -75,6 +75,11 @@ from vllm_ascend.utils import (enable_dsa_cp, enable_dsa_cp_with_layer_shard, en
 logger = init_logger(__name__)
 
 
+def is_attention_output_layer(prefix: str) -> bool:
+    return any(token in prefix for token in ("o_proj", "out_proj",
+                                             "attention.dense"))
+
+
 class CustomLinearOp:
 
     def __init__(self, layer):
@@ -570,8 +575,15 @@ class SequenceRowParallelOp(CustomRowParallelOp):
             forward_context = get_forward_context()
             sp_enabled = forward_context.sp_enabled
             mmrs_fusion = forward_context.mmrs_fusion
+            is_context_moe_model = getattr(forward_context,
+                                           "is_context_moe_model", False)
         except AssertionError:
             sp_enabled = False
+            mmrs_fusion = False
+            is_context_moe_model = False
+
+        if is_context_moe_model and not is_attention_output_layer(
+                self.layer.prefix):
             mmrs_fusion = False
 
         x = input_parallel
