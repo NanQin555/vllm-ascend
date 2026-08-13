@@ -18,9 +18,63 @@
 # limitations under the License.
 #
 
+import logging
 import os
 from collections.abc import Callable
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+SHMEM_MATMUL_ALLREDUCE_ENV_NAME = (
+    "VLLM_ASCEND_ENABLE_SHMEM_MATMUL_ALLREDUCE"
+)
+
+
+def normalize_shmem_matmul_allreduce_env() -> None:
+    """Normalize common misspellings of the SHMEM MAR enable switch.
+
+    Environment variable names are case-sensitive.  Normalize only aliases
+    that differ by letter case or the common ``ASCNED`` transposition, then
+    remove the alias so vLLM's strict environment validation sees only the
+    canonical name.
+    """
+    aliases = []
+    for name in tuple(os.environ):
+        normalized_name = name.upper().replace("VLLM_ASCNED_", "VLLM_ASCEND_")
+        if (
+            name != SHMEM_MATMUL_ALLREDUCE_ENV_NAME
+            and normalized_name == SHMEM_MATMUL_ALLREDUCE_ENV_NAME
+        ):
+            aliases.append(name)
+
+    if not aliases:
+        return
+
+    alias_values = {os.environ[name] for name in aliases}
+    canonical_value = os.environ.get(SHMEM_MATMUL_ALLREDUCE_ENV_NAME)
+    if canonical_value is None:
+        if len(alias_values) != 1:
+            raise ValueError(
+                "Conflicting misspelled SHMEM MatmulAllReduce environment "
+                f"variables: {aliases}"
+            )
+        os.environ[SHMEM_MATMUL_ALLREDUCE_ENV_NAME] = alias_values.pop()
+    elif any(os.environ[name] != canonical_value for name in aliases):
+        logger.warning(
+            "Ignoring conflicting misspelled SHMEM MatmulAllReduce "
+            "environment variables %s; %s takes precedence",
+            aliases,
+            SHMEM_MATMUL_ALLREDUCE_ENV_NAME,
+        )
+
+    for name in aliases:
+        os.environ.pop(name, None)
+    logger.warning(
+        "Normalized misspelled environment variable(s) %s to %s. "
+        "Update the launch configuration to use the canonical spelling.",
+        aliases,
+        SHMEM_MATMUL_ALLREDUCE_ENV_NAME,
+    )
 
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
@@ -71,9 +125,60 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE", "0"))),
     # Whether to use the experimental aclshmem tile-overlap MatmulAllReduce
     # kernel for eligible BF16 RowParallelLinear layers.
-    "VLLM_ASCEND_ENABLE_SHMEM_MATMUL_ALLREDUCE": lambda: (
-        os.getenv("VLLM_ASCEND_ENABLE_SHMEM_MATMUL_ALLREDUCE", "0").lower()
+    SHMEM_MATMUL_ALLREDUCE_ENV_NAME: lambda: (
+        os.getenv(SHMEM_MATMUL_ALLREDUCE_ENV_NAME, "0").lower()
         in {"1", "on", "true", "yes"}
+    ),
+    # SHMEM kernel launch/tuning options. These are also registered with
+    # vLLM's environment registry by the Ascend platform plugin so that vLLM
+    # does not report them as unknown and includes them in compile cache keys.
+    "VLLM_ASCEND_SHMEM_AIC_CHUNK_TILES": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_AIC_CHUNK_TILES"
+    ),
+    "VLLM_ASCEND_SHMEM_AIV_CHUNK_TILES": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_AIV_CHUNK_TILES"
+    ),
+    "VLLM_ASCEND_SHMEM_AIV_ALLGATHER_CHUNK_TILES": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_AIV_ALLGATHER_CHUNK_TILES"
+    ),
+    "VLLM_ASCEND_SHMEM_AIV_ACTIVE_CORES": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_AIV_ACTIVE_CORES"
+    ),
+    "VLLM_ASCEND_SHMEM_AGMM_COMM_INTERVAL": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_AGMM_COMM_INTERVAL"
+    ),
+    "VLLM_ASCEND_SHMEM_MATMUL_AR_REDUCE_METHOD": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_MATMUL_AR_REDUCE_METHOD"
+    ),
+    "VLLM_ASCEND_SHMEM_MMRS_REDUCE_ORDER": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_MMRS_REDUCE_ORDER"
+    ),
+    "VLLM_ASCEND_SHMEM_OWNER_BASE": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_OWNER_BASE"
+    ),
+    "VLLM_ASCEND_SHMEM_BLOCK_DIMS": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_BLOCK_DIMS"
+    ),
+    "VLLM_ASCEND_SHMEM_IP_PORT": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_IP_PORT"
+    ),
+    "VLLM_ASCEND_SHMEM_LOCAL_MEM_SIZE": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_LOCAL_MEM_SIZE"
+    ),
+    "VLLM_ASCEND_SHMEM_OUTPUT_BUFFER_BYTES": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_OUTPUT_BUFFER_BYTES"
+    ),
+    "VLLM_ASCEND_SHMEM_OUTPUT_MAX_TOKENS": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_OUTPUT_MAX_TOKENS"
+    ),
+    "VLLM_ASCEND_SHMEM_DEBUG_TIMESTAMPS": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_DEBUG_TIMESTAMPS"
+    ),
+    "VLLM_ASCEND_SHMEM_DEBUG_TIMESTAMPS_HOST_COLLECT": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_DEBUG_TIMESTAMPS_HOST_COLLECT"
+    ),
+    "VLLM_ASCEND_SHMEM_DEBUG_TIMESTAMPS_LIMIT": lambda: os.getenv(
+        "VLLM_ASCEND_SHMEM_DEBUG_TIMESTAMPS_LIMIT"
     ),
     # Whether to enable FlashComm optimization when tensor parallel is enabled.
     # This feature will get better performance when concurrency is large.

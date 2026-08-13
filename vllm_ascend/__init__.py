@@ -18,6 +18,39 @@
 _GLOBAL_PATCH_APPLIED = False
 
 
+def _register_ascend_env_variables() -> None:
+    """Expose Ascend variables before vLLM validates the environment."""
+    from vllm_ascend.envs import (
+        env_variables as ascend_env_variables,
+        normalize_shmem_matmul_allreduce_env,
+    )
+
+    normalize_shmem_matmul_allreduce_env()
+
+    try:
+        import vllm.envs as vllm_envs
+    except ModuleNotFoundError as exc:
+        if exc.name != "vllm":
+            raise
+        return
+
+    registry = getattr(vllm_envs, "environment_variables", None)
+    if registry is None:
+        registry = getattr(vllm_envs, "env_variables", None)
+    if registry is None:
+        return
+
+    for name, getter in ascend_env_variables.items():
+        if name.startswith("VLLM_"):
+            registry.setdefault(name, getter)
+
+
+# Entry-point loading imports this module before invoking ``register``.  Do
+# the registration at import time so vLLM 0.23's validate_environ() cannot run
+# first and reject an out-of-tree Ascend variable.
+_register_ascend_env_variables()
+
+
 def _ensure_global_patch():
     """Apply process-wide vLLM patches before engine-core initialization.
 
@@ -38,6 +71,9 @@ def _ensure_global_patch():
 def register():
     """Register the NPU platform."""
 
+    # Keep this call for spawned processes and direct invocations. Registration
+    # uses setdefault and is intentionally idempotent.
+    _register_ascend_env_variables()
     return "vllm_ascend.platform.NPUPlatform"
 
 

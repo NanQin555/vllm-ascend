@@ -20,6 +20,7 @@ _DEFAULT_LOCAL_MEM_SIZE = 1024 * 1024 * 1024
 _DEFAULT_IP_PORT = "tcp://127.0.0.1:8667"
 _OUTPUT_BUFFER_ALIGNMENT = 512
 _MAX_SUPPORTED_RANKS = 8
+_MAR_HCOMM_KERNEL_INFO = "matmul_allreduce=HCOMM wave small/mid/big"
 _CACHED_BLOCK_DIMS: Optional[int] = None
 _KERNEL_NAME_BY_DTYPE = {
     torch.bfloat16: "shmem_matmul_allreduce_overlap_bf16",
@@ -212,6 +213,7 @@ class _ShmemRuntime:
         self._operators: dict[int, object] = {}
         self._kernel_entries: dict[tuple[int, str], Any] = {}
         self._output_buffers: dict[tuple[torch.dtype, str], _SymmetricOutputBuffer] = {}
+        self._printed_operator_call = False
         self._rank: Optional[int] = None
         self._world_size: Optional[int] = None
 
@@ -235,6 +237,16 @@ class _ShmemRuntime:
                 shmem_operators = importlib.import_module("shmem_operators")
             except ImportError as exc:
                 return f"missing_shmem_operators:{exc}"
+
+            kernel_info = str(
+                getattr(shmem_operators, "__kernel_info__", "<missing>")
+            )
+            if _MAR_HCOMM_KERNEL_INFO not in kernel_info:
+                return (
+                    "incompatible_shmem_operators:expected_mar_hcomm;"
+                    f"module={getattr(shmem_operators, '__file__', '<unknown>')};"
+                    f"kernel_info={kernel_info}"
+                )
 
             if not dist.is_initialized():
                 return "torch_distributed_not_initialized"
@@ -284,13 +296,13 @@ class _ShmemRuntime:
             self._world_size = tp_size
             self._initialized = True
             logger.info(
-                "Initialized shmem runtime for matmul-allreduce: "
-                "rank=%s world_size=%s ip_port=%s module=%s build=%s",
+                "Initialized mar-hcomm SHMEM runtime: rank=%s "
+                "world_size=%s module=%s build=%s kernel_info=%s",
                 attr.my_rank,
                 attr.n_ranks,
-                ip_port,
                 getattr(shmem_operators, "__file__", "<unknown>"),
                 getattr(shmem_operators, "__build_info__", "<unknown>"),
+                kernel_info,
             )
             return None
 
@@ -307,6 +319,31 @@ class _ShmemRuntime:
                 kernel_entry = getattr(operator, kernel_name, None)
                 self._kernel_entries[key] = kernel_entry
             return kernel_entry
+
+    def log_operator_call_once(
+        self,
+        layer_name: str,
+        m: int,
+        n: int,
+        k: int,
+        dtype: torch.dtype,
+    ) -> None:
+        with self._lock:
+            if self._printed_operator_call or self._rank != 0:
+                return
+            self._printed_operator_call = True
+            world_size = self._world_size
+
+        logger.warning(
+            "[shmem-operator] called=1 initialized=1 "
+            "rank=0/%s layer=%s shape=(%s,%s,%s) dtype=%s",
+            world_size,
+            layer_name,
+            m,
+            n,
+            k,
+            dtype,
+        )
 
     def get_symmetric_output(
         self,
@@ -366,13 +403,6 @@ class _ShmemRuntime:
                     requested_bytes,
                 )
                 self._output_buffers[key] = buffer
-                logger.info(
-                    "Allocated shmem output buffer: dtype=%s device=%s "
-                    "buffer_bytes=%s",
-                    dtype,
-                    normalized_device,
-                    buffer.buffer_bytes,
-                )
             return buffer.make_tensor(shape, requested_bytes)
 
     def destroy(self) -> None:
@@ -499,5 +529,12 @@ def maybe_shmem_matmul_allreduce(
         weight_t.shape[1],
         input_2d.shape[1],
         stream_handle,
+    )
+    _RUNTIME.log_operator_call_once(
+        str(layer.prefix),
+        int(input_2d.shape[0]),
+        int(weight_t.shape[1]),
+        int(input_2d.shape[1]),
+        input_2d.dtype,
     )
     return output_2d.reshape(*input_parallel.shape[:-1], weight_t.shape[1])

@@ -25,6 +25,7 @@ import torch.nn as nn
 from torch.nn.parameter import Parameter
 from vllm.config import get_current_vllm_config
 from vllm.distributed import divide, split_tensor_along_last_dim
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.layers.linear import (  # noqa
     WEIGHT_LOADER_V2_SUPPORTED,
     ColumnParallelLinear,
@@ -302,8 +303,12 @@ class AscendRowParallelLinear(RowParallelLinear):
     ):
         # TODO(kunpengW-code): Specifying the prefix in linear layers of some models in the vLLM.
         shmem_enabled = shmem_matmul_allreduce_enabled()
-        shmem_target = shmem_enabled and any(token in prefix for token in ("o_proj", "down_proj"))
-        shmem_target = shmem_target and "shared_expert" not in prefix
+        shmem_target = (
+            shmem_enabled
+            and not disable_tp
+            and any(token in prefix for token in ("o_proj", "down_proj"))
+            and "shared_expert" not in prefix
+        )
         self.unique_prefix = prefix
         if enable_sp() or shmem_target:
             compilation_config = get_current_vllm_config().compilation_config
@@ -314,7 +319,18 @@ class AscendRowParallelLinear(RowParallelLinear):
             self.unique_prefix = unique_prefix
             compilation_config.static_forward_context[unique_prefix] = self
 
-        self.custom_op, self.tp_rank, self.tp_size = get_parallel_op(disable_tp, prefix, self, "row")
+        if shmem_target:
+            # The SHMEM runtime currently bootstraps the global TP group. Do
+            # not route an explicitly selected SHMEM layer through the native
+            # or sequence-parallel custom-op selector first.
+            tp_group = get_tp_group()
+            self.custom_op = None
+            self.tp_rank = tp_group.rank_in_group
+            self.tp_size = tp_group.world_size
+        else:
+            self.custom_op, self.tp_rank, self.tp_size = get_parallel_op(
+                disable_tp, prefix, self, "row"
+            )
         # TODO(realliujiaxu): Replace the initialization code below with super().__init__ after
         # linear of vllm supports custom comm group
         # Divide the weight matrix along the first dimension.
@@ -367,13 +383,6 @@ class AscendRowParallelLinear(RowParallelLinear):
         else:
             self.register_parameter("bias", None)
 
-        if shmem_target and self.custom_op is not None:
-            raise RuntimeError(
-                "SHMEM MatmulAllReduce cannot be combined with the selected "
-                f"row-parallel optimization {type(self.custom_op).__name__}: "
-                f"layer={prefix}"
-            )
-
         self._can_try_shmem_matmul_allreduce = (
             shmem_target
             and reduce_results
@@ -384,6 +393,18 @@ class AscendRowParallelLinear(RowParallelLinear):
             and self.out_dtype in (None, torch.bfloat16)
             and get_ascend_device_type() == AscendDeviceType.A2
         )
+        if shmem_target and not self._can_try_shmem_matmul_allreduce:
+            raise RuntimeError(
+                "SHMEM HCOMM MatmulAllReduce requires Ascend A2, BF16 "
+                "unquantized weights, no bias, BF16 output, "
+                "reduce_results=True, and TP size in [2, 8]: "
+                f"layer={prefix} tp_size={self.tp_size} "
+                f"reduce_results={reduce_results} "
+                f"bias={self.bias is not None} "
+                f"weight_dtype={self.weight.dtype} "
+                f"out_dtype={self.out_dtype} "
+                f"device_type={get_ascend_device_type()}"
+            )
         if self._can_try_shmem_matmul_allreduce:
             prepare_shmem_matmul_allreduce(self)
 
