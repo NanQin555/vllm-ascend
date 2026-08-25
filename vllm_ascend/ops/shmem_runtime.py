@@ -16,10 +16,16 @@ from vllm_ascend.ascend_config import get_ascend_config
 logger = init_logger(__name__)
 
 _DEFAULT_BLOCK_DIMS = 20
-_DEFAULT_LOCAL_MEM_SIZE = 1024 * 1024 * 1024
+_MIN_LOCAL_MEM_SIZE = 256 * 1024 * 1024
 _DEFAULT_IP_PORT = "tcp://127.0.0.1:8667"
 _OUTPUT_BUFFER_ALIGNMENT = 512
 _MAX_SUPPORTED_RANKS = 8
+_MAR_MAX_N = 5120
+_MAR_MAX_STAGE_ROWS = 4096
+_MAR_WORKSPACE_STAGES = 2
+_MAR_CONTROL_BYTES = 64 * 1024
+_MAR_BF16_BYTES = 2
+_SHMEM_HEAP_RESERVE_BYTES = 32 * 1024 * 1024
 _MAR_HCOMM_KERNEL_INFO = "matmul_allreduce=HCOMM wave small/mid/big"
 _CACHED_BLOCK_DIMS: Optional[int] = None
 _KERNEL_NAME_BY_DTYPE = {
@@ -97,6 +103,33 @@ def _get_prealloc_output_tokens() -> int:
     return int(get_current_vllm_config().scheduler_config.max_num_batched_tokens)
 
 
+def _get_default_local_mem_size() -> int:
+    """Size the MAR-only symmetric heap from its actual allocations.
+
+    The old fixed 1 GiB heap reduced the memory left for KV cache even though
+    MAR needs one maximum-size two-stage workspace plus one output buffer.
+    Keep a 256 MiB floor for allocator/runtime metadata, and grow
+    automatically when max_num_batched_tokens requires a larger output.
+    """
+    workspace_bytes = (
+        _MAR_CONTROL_BYTES
+        + _MAR_WORKSPACE_STAGES
+        * _MAR_MAX_STAGE_ROWS
+        * _MAR_MAX_N
+        * _MAR_BF16_BYTES
+    )
+    output_bytes = (
+        _get_prealloc_output_tokens() * _MAR_MAX_N * _MAR_BF16_BYTES
+    )
+    required_bytes = (
+        workspace_bytes + output_bytes + _SHMEM_HEAP_RESERVE_BYTES
+    )
+    return max(
+        _MIN_LOCAL_MEM_SIZE,
+        _align_up(required_bytes, 2 * 1024 * 1024),
+    )
+
+
 def _is_graph_capturing() -> bool:
     if not is_forward_context_available():
         return False
@@ -114,9 +147,30 @@ def _build_weight_for_shmem(layer: torch.nn.Module) -> torch.Tensor:
     ):
         cached = weight_t_view.contiguous()
         setattr(layer, "_shmem_matmul_allreduce_weight_t", cached)
-    else:
+    elif cached.data_ptr() != weight_t_view.data_ptr():
         cached.copy_(weight_t_view)
     return cached
+
+
+def _share_weight_storage_with_shmem(
+    layer: torch.nn.Module,
+    weight_t: torch.Tensor,
+) -> None:
+    """Keep the logical [N,K] parameter as a view of SHMEM's [K,N] weight.
+
+    SHMEM is the only forward path for an eligible layer, so retaining both
+    the original row-major/NZ parameter and a contiguous transpose wastes the
+    full row-parallel weight size. The transposed view preserves the public
+    parameter shape and values while sharing the kernel-ready allocation.
+    """
+    logical_weight = weight_t.transpose(0, 1)
+    if logical_weight.shape != layer.weight.shape:
+        raise RuntimeError(
+            "shmem matmul-allreduce logical weight shape changed: "
+            f"parameter={tuple(layer.weight.shape)} "
+            f"transposed={tuple(logical_weight.shape)}"
+        )
+    layer.weight.data = logical_weight
 
 
 def prepare_shmem_matmul_allreduce(layer: torch.nn.Module) -> None:
@@ -271,9 +325,11 @@ class _ShmemRuntime:
             attr.local_mem_size = int(
                 os.getenv(
                     "VLLM_ASCEND_SHMEM_LOCAL_MEM_SIZE",
-                    str(_DEFAULT_LOCAL_MEM_SIZE),
+                    str(_get_default_local_mem_size()),
                 )
             )
+            if attr.local_mem_size <= 0:
+                return "invalid_local_mem_size"
             attr.ip_port = ip_port
 
             ret = ash.aclshmem_init(attr)
@@ -297,9 +353,11 @@ class _ShmemRuntime:
             self._initialized = True
             logger.info(
                 "Initialized mar-hcomm SHMEM runtime: rank=%s "
-                "world_size=%s module=%s build=%s kernel_info=%s",
+                "world_size=%s local_mem_size=%s module=%s build=%s "
+                "kernel_info=%s",
                 attr.my_rank,
                 attr.n_ranks,
+                attr.local_mem_size,
                 getattr(shmem_operators, "__file__", "<unknown>"),
                 getattr(shmem_operators, "__build_info__", "<unknown>"),
                 kernel_info,
@@ -467,6 +525,7 @@ def finalize_shmem_matmul_allreduce(layer: torch.nn.Module) -> None:
         weight_t.dtype,
         weight_t.device,
     )
+    _share_weight_storage_with_shmem(layer, weight_t)
 
 
 def maybe_shmem_matmul_allreduce(

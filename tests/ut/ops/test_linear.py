@@ -12,6 +12,7 @@ from vllm_ascend.ops.linear import (
     AscendReplicatedLinear,
     AscendRowParallelLinear,
     AscendUnquantizedLinearMethod,
+    _is_shmem_matmul_allreduce_target,
 )
 
 
@@ -90,6 +91,30 @@ class TestAscendUnquantizedLinearMethod(TestBase):
 
 
 class TestAscendRowParallelLinear(BaseLinearTest):
+    def test_qwen36_shmem_projection_targets(self):
+        for projection in ("o_proj", "out_proj", "down_proj"):
+            prefix = f"model.layers.0.self_attn.{projection}"
+            self.assertTrue(
+                _is_shmem_matmul_allreduce_target(
+                    prefix, enabled=True, disable_tp=False
+                )
+            )
+
+        self.assertFalse(
+            _is_shmem_matmul_allreduce_target(
+                "model.layers.0.self_attn.out_proj",
+                enabled=True,
+                disable_tp=True,
+            )
+        )
+        self.assertFalse(
+            _is_shmem_matmul_allreduce_target(
+                "model.layers.0.shared_expert.down_proj",
+                enabled=True,
+                disable_tp=False,
+            )
+        )
+
     @patch("vllm_ascend.ops.linear_op.get_weight_prefetch_method", return_value=MagicMock())
     @patch("vllm_ascend.ops.linear.get_current_vllm_config", return_value=MagicMock())
     @patch("vllm_ascend.ops.linear.enable_sp", return_value=False)

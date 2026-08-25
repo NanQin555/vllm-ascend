@@ -56,6 +56,33 @@ from vllm_ascend.utils import (
 )
 
 
+_SHMEM_ROW_PARALLEL_PROJECTIONS = frozenset(
+    {"o_proj", "out_proj", "down_proj"}
+)
+
+
+def _is_shmem_matmul_allreduce_target(
+    prefix: str,
+    *,
+    enabled: bool,
+    disable_tp: bool,
+) -> bool:
+    """Select dense row-parallel projections handled by SHMEM MAR.
+
+    Qwen3.5/Qwen3.6 Gated DeltaNet names its output projection
+    ``out_proj``; full attention uses ``o_proj`` and the shared dense FFN uses
+    ``down_proj``. Match the final path component so unrelated names that only
+    contain one of these tokens are not selected accidentally.
+    """
+    projection_name = prefix.rsplit(".", 1)[-1]
+    return (
+        enabled
+        and not disable_tp
+        and projection_name in _SHMEM_ROW_PARALLEL_PROJECTIONS
+        and "shared_expert" not in prefix
+    )
+
+
 def unquantized_gemm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -303,11 +330,10 @@ class AscendRowParallelLinear(RowParallelLinear):
     ):
         # TODO(kunpengW-code): Specifying the prefix in linear layers of some models in the vLLM.
         shmem_enabled = shmem_matmul_allreduce_enabled()
-        shmem_target = (
-            shmem_enabled
-            and not disable_tp
-            and any(token in prefix for token in ("o_proj", "down_proj"))
-            and "shared_expert" not in prefix
+        shmem_target = _is_shmem_matmul_allreduce_target(
+            prefix,
+            enabled=shmem_enabled,
+            disable_tp=disable_tp,
         )
         self.unique_prefix = prefix
         if enable_sp() or shmem_target:
